@@ -1,0 +1,68 @@
+name: yuanrong-review
+version: 1.0.0
+description: openYuanrong PR Review Tool - Review PRs across 6 sub-repositories
+
+commands:
+  list:
+    description: List open PRs for a repository
+    usage: /yuanrong-review list [repo-name] [--state open|closed|all] [--limit N]
+    examples:
+      - /yuanrong-review list
+      - /yuanrong-review list frontend --limit 5
+      - /yuanrong-review list fs --state all
+
+  show:
+    description: Show PR details
+    usage: /yuanrong-review show <repo-name>/<pr-number>
+    examples:
+      - /yuanrong-review show yuanrong/448
+      - /yuanrong-review show fs/23
+
+  review:
+    description: Review a PR and post line-level comments
+    usage: /yuanrong-review review <repo-name>/<pr-number> [--style strict|normal|gentle]
+    examples:
+      - /yuanrong-review review yuanrong/448
+      - /yuanrong-review review ds/15 --style strict
+
+  repos:
+    description: Manage repository mappings
+    usage: /yuanrong-review repos [list|add|remove]
+    examples:
+      - /yuanrong-review repos list
+      - /yuanrong-review repos add myrepo openeuler/myrepo
+
+config:
+  file: ~/.config/yuanrong-review/config.yaml
+  env:
+    - name: YUANRONG_PAT
+      description: GitCode Personal Access Token
+      required: true
+  defaults:
+    owner: openeuler
+    default_repo: yuanrong
+    review_style: normal
+
+repositories:
+  mapping:
+    yuanrong: openeuler/yuanrong
+    main: openeuler/yuanrong
+    core: openeuler/yuanrong
+
+    ray-adapter: openeuler/ray-adapter
+    ray: openeuler/ray-adapter
+
+    frontend: openeuler/yuanrong-frontend
+    fe: openeuler/yuanrong-frontend
+    ui: openeuler/yuanrong-frontend
+
+    functionsystem: openeuler/yuanrong-functionsystem
+    fs: openeuler/yuanrong-functionsystem
+    func: openeuler/yuanrong-functionsystem
+
+    datasystem: openeuler/yuanrong-datasystem
+    ds: openeuler/yuanrong-datasystem
+    data: openeuler/yuanrong-datasystem
+
+    runtime: openeuler/yuanrong-runtime
+    rt: openeuler/yuanrong-runtime

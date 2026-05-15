@@ -1,0 +1,22 @@
+# Secrets and local migration configs
+**/config/*.local
+**/config/*.env
+**/config/config.yaml
+**/config/wg0.conf
+**/config/kubekind.yaml
+!**/config/*.example
+!**/config/*.template
+
+# Python/cache output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Buildkite/local artifacts
+buildkite-artifacts/
+artifacts/
+*.log
+
+# Editor/system noise
+.DS_Store
+*.swp

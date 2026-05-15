@@ -1,0 +1,11 @@
+# Copy to config/config.yaml.local or ~/.config/yuanrong-review/config.yaml.
+# Do not commit files containing real tokens.
+
+api:
+  base_url: "https://api.gitcode.com/api/v5"
+  access_token: "${YUANRONG_PAT}"
+
+defaults:
+  owner: "openeuler"
+  default_repo: "yuanrong"
+  review_style: "normal"

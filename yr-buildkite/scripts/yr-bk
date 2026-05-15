@@ -1,0 +1,610 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_DIR="${YR_BK_CONFIG_DIR:-$HOME/.config/yr-buildkite}"
+CONFIG_FILE="${YR_BK_CONFIG:-$CONFIG_DIR/config.env}"
+STATE_DIR="$CONFIG_DIR/state"
+LATEST_FILE="$STATE_DIR/latest.json"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SKILL_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
+LOCAL_CONFIG_FILE="${YR_BK_LOCAL_CONFIG:-$SKILL_DIR/config/config.env.local}"
+
+# Built-in YuanRong defaults. User overrides live in config.env, env vars, or CLI flags.
+: "${YR_BK_ORG:=yuchao-wang}"
+: "${YR_BK_PIPELINE:=yuanrong}"
+: "${YR_BK_DEFAULT_REPO:=https://gitcode.com/yuchaow/yuanrong.git}"
+: "${YR_BK_TARGET_REPO:=https://gitcode.com/openeuler/yuanrong.git}"
+: "${YR_BK_FUNCTIONSYSTEM_REPO:=https://gitcode.com/openeuler/yuanrong-functionsystem.git}"
+: "${YR_BK_FUNCTIONSYSTEM_BRANCH:=rust-rewrite}"
+: "${YR_BK_RUST_BUILDER_IMAGE:=swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/compile-ubuntu2004-rust:v20260507_x86_64}"
+: "${YR_BK_ENABLE_LINUX_ARM:=false}"
+: "${YR_BK_ENABLE_SANDBOX_PACKAGE:=false}"
+: "${YR_BK_ARTIFACT_ROOT:=./buildkite-artifacts}"
+: "${YR_BK_KUBECONFIG:=$CONFIG_DIR/kubekind.yaml}"
+: "${YR_BK_K8S_NAMESPACE:=default}"
+: "${YR_BK_K8S_APISERVER:=auto}"
+: "${YR_BK_AGENT_STACK_AMD64:=agent-stack-k8s-56f4bdcfc4-djww7}"
+: "${YR_BK_AGENT_STACK_ARM64:=agent-stack-k8s-arm64-6fb794684b-djh6b}"
+: "${YR_BK_VPN_INTERFACE:=wg0}"
+: "${YR_BK_VPN_CONFIG:=$CONFIG_DIR/wg0.conf}"
+: "${YR_BK_VPN_ENDPOINT:=1.95.162.207:51820}"
+: "${YR_BK_VPN_ADDRESS:=10.99.0.2/24}"
+: "${YR_BK_VPN_SERVER_IP:=10.99.0.1}"
+: "${YR_BK_VPN_ALLOWED_IPS:=10.99.0.0/24,10.10.0.0/16}"
+: "${YR_BK_VPN_CHECK_HOSTS:=10.99.0.1}"
+: "${SWR_REGISTRY:=swr.cn-southwest-2.myhuaweicloud.com}"
+
+load_config() {
+  # Config provides defaults; explicit environment variables keep precedence.
+  local keep_BUILDKITE_API_TOKEN="${BUILDKITE_API_TOKEN-__YR_UNSET__}"
+  local keep_GITCODE_TOKEN="${GITCODE_TOKEN-__YR_UNSET__}"
+  local keep_SWR_USERNAME="${SWR_USERNAME-__YR_UNSET__}"
+  local keep_SWR_PASSWORD="${SWR_PASSWORD-__YR_UNSET__}"
+  if [[ -f "$LOCAL_CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    set -a; source "$LOCAL_CONFIG_FILE"; set +a
+  fi
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    set -a; source "$CONFIG_FILE"; set +a
+  fi
+  [[ "$keep_BUILDKITE_API_TOKEN" != __YR_UNSET__ ]] && BUILDKITE_API_TOKEN="$keep_BUILDKITE_API_TOKEN"
+  [[ "$keep_GITCODE_TOKEN" != __YR_UNSET__ ]] && GITCODE_TOKEN="$keep_GITCODE_TOKEN"
+  [[ "$keep_SWR_USERNAME" != __YR_UNSET__ ]] && SWR_USERNAME="$keep_SWR_USERNAME"
+  [[ "$keep_SWR_PASSWORD" != __YR_UNSET__ ]] && SWR_PASSWORD="$keep_SWR_PASSWORD"
+  return 0
+}
+load_config
+
+mkdirs() { mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$SKILL_DIR/config"; }
+redact() { sed -E 's/(TOKEN|PASSWORD|SECRET|PRIVATE_KEY|CLIENT_KEY|ACCESS_KEY)([^=]*=).*/\1\2REDACTED/I'; }
+expand_path() { local p="${1:-}"; [[ "$p" == ~* ]] && printf '%s\n' "${p/#\~/$HOME}" || printf '%s\n' "$p"; }
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1" >&2; return 1; }; }
+api_base() { printf 'https://api.buildkite.com/v2/organizations/%s/pipelines/%s' "$YR_BK_ORG" "$YR_BK_PIPELINE"; }
+require_token() { [[ -n "${BUILDKITE_API_TOKEN:-}" ]] || { echo "Buildkite token is required. Run: yr-bk init" >&2; exit 2; }; }
+api_get() { require_token; curl -sS -H "Authorization: Bearer $BUILDKITE_API_TOKEN" "$1"; }
+api_post() { require_token; curl -sS -H "Authorization: Bearer $BUILDKITE_API_TOKEN" -H 'Content-Type: application/json' -X POST "$1" -d "$2"; }
+api_patch() { require_token; curl -sS -H "Authorization: Bearer $BUILDKITE_API_TOKEN" -H 'Content-Type: application/json' -X PATCH "$1" -d "$2"; }
+api_put() { require_token; curl -sS -H "Authorization: Bearer $BUILDKITE_API_TOKEN" -X PUT "$1"; }
+
+usage() {
+  cat <<'USAGE'
+yr-bk - local YuanRong Buildkite helper
+
+Setup:
+  yr-bk init [--kubeconfig FILE] [--swr] [--validate-only]
+  yr-bk config path|edit|show
+
+Buildkite:
+  yr-bk trigger rust-x86 [--watch] [--collect] [--branch B] [--commit SHA] [--repo URL]
+  yr-bk status <build|latest>
+  yr-bk jobs <build|latest>
+  yr-bk running <build|latest>
+  yr-bk latest
+  yr-bk cancel <build|latest>
+  yr-bk watch <build|latest> [--interval SEC] [--tail N] [--collect-on-finish]
+  yr-bk log <build|latest> <job-alias|job-id> [--tail N]
+  yr-bk artifacts list <build|latest>
+  yr-bk artifacts download <build|latest> [--pattern GLOB]
+  yr-bk collect <build|latest> [--pattern GLOB]
+
+Optional diagnostics:
+  yr-bk k8s pods|agent-logs amd64|agent-logs arm64|logs <build> <job>|describe <build> <job>
+  yr-bk vpn check|install-plan|up|down
+  yr-bk image check|manifest|smoke IMAGE
+USAGE
+}
+
+write_default_config() {
+  mkdirs
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    cat > "$CONFIG_FILE" <<CFG
+# ~/.config/yr-buildkite/config.env
+# One-file config for yr-bk. Keep chmod 600 if secrets are filled.
+
+# ===== Buildkite: required =====
+BUILDKITE_API_TOKEN=${BUILDKITE_API_TOKEN:-}
+YR_BK_ORG=$YR_BK_ORG
+YR_BK_PIPELINE=$YR_BK_PIPELINE
+
+# ===== YuanRong repos and default E2E target =====
+YR_BK_DEFAULT_REPO=$YR_BK_DEFAULT_REPO
+YR_BK_TARGET_REPO=$YR_BK_TARGET_REPO
+YR_BK_FUNCTIONSYSTEM_REPO=$YR_BK_FUNCTIONSYSTEM_REPO
+YR_BK_FUNCTIONSYSTEM_BRANCH=$YR_BK_FUNCTIONSYSTEM_BRANCH
+YR_BK_RUST_BUILDER_IMAGE=$YR_BK_RUST_BUILDER_IMAGE
+YR_BK_ENABLE_LINUX_ARM=$YR_BK_ENABLE_LINUX_ARM
+YR_BK_ENABLE_SANDBOX_PACKAGE=$YR_BK_ENABLE_SANDBOX_PACKAGE
+
+# ===== Local output =====
+YR_BK_ARTIFACT_ROOT=$YR_BK_ARTIFACT_ROOT
+
+# ===== Kubernetes diagnostics: optional =====
+YR_BK_KUBECONFIG=$CONFIG_DIR/kubekind.yaml
+YR_BK_K8S_NAMESPACE=$YR_BK_K8S_NAMESPACE
+YR_BK_K8S_APISERVER=auto
+YR_BK_AGENT_STACK_AMD64=$YR_BK_AGENT_STACK_AMD64
+YR_BK_AGENT_STACK_ARM64=$YR_BK_AGENT_STACK_ARM64
+
+# ===== VPN/WireGuard diagnostics: optional =====
+YR_BK_VPN_INTERFACE=$YR_BK_VPN_INTERFACE
+YR_BK_VPN_CONFIG=$CONFIG_DIR/wg0.conf
+YR_BK_VPN_ENDPOINT=$YR_BK_VPN_ENDPOINT
+YR_BK_VPN_ADDRESS=$YR_BK_VPN_ADDRESS
+YR_BK_VPN_SERVER_IP=$YR_BK_VPN_SERVER_IP
+YR_BK_VPN_ALLOWED_IPS=$YR_BK_VPN_ALLOWED_IPS
+YR_BK_VPN_CHECK_HOSTS=$YR_BK_VPN_CHECK_HOSTS
+
+# ===== SWR image workflow: optional =====
+SWR_REGISTRY=$SWR_REGISTRY
+SWR_USERNAME=${SWR_USERNAME:-}
+SWR_PASSWORD=${SWR_PASSWORD:-}
+
+# ===== GitCode API: optional =====
+GITCODE_TOKEN=${GITCODE_TOKEN:-}
+CFG
+    chmod 600 "$CONFIG_FILE"
+  fi
+  if [[ ! -f "$LOCAL_CONFIG_FILE" ]]; then
+    cp "$CONFIG_FILE" "$LOCAL_CONFIG_FILE"
+    chmod 600 "$LOCAL_CONFIG_FILE"
+  fi
+}
+
+set_config_value() {
+  local key="$1" value="$2"
+  local target
+  mkdirs
+  for target in "$CONFIG_FILE" "$LOCAL_CONFIG_FILE"; do
+    touch "$target"; chmod 600 "$target"
+    if grep -qE "^${key}=" "$target"; then
+      python3 - "$target" "$key" "$value" <<'PY'
+from pathlib import Path
+import sys
+path,key,value=Path(sys.argv[1]),sys.argv[2],sys.argv[3]
+lines=path.read_text().splitlines()
+for i,l in enumerate(lines):
+    if l.startswith(key+'='):
+        lines[i]=f'{key}={value}'
+        break
+path.write_text('\n'.join(lines)+'\n')
+PY
+    else
+      printf '%s=%s\n' "$key" "$value" >> "$target"
+    fi
+  done
+}
+
+cmd_init() {
+  local kube_src="" want_swr=false validate_only=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --kubeconfig) kube_src="${2:?missing kubeconfig}"; shift ;;
+      --swr) want_swr=true ;;
+      --validate-only) validate_only=true ;;
+      --from-env) ;;
+      *) echo "Unknown init option: $1" >&2; exit 2 ;;
+    esac
+    shift
+  done
+  if [[ "$validate_only" == true ]]; then
+    load_config
+    validate_config
+    return
+  fi
+  write_default_config
+  load_config
+  if [[ "$validate_only" == false ]]; then
+    if [[ -z "${BUILDKITE_API_TOKEN:-}" ]]; then
+      printf 'Buildkite API token [required]: ' >&2
+      stty -echo 2>/dev/null || true
+      IFS= read -r token
+      stty echo 2>/dev/null || true
+      printf '\n' >&2
+      [[ -n "$token" ]] && set_config_value BUILDKITE_API_TOKEN "$token"
+    fi
+    if [[ -n "$kube_src" ]]; then
+      mkdir -p "$CONFIG_DIR"
+      cp "$kube_src" "$CONFIG_DIR/kubekind.yaml"
+      chmod 600 "$CONFIG_DIR/kubekind.yaml"
+      set_config_value YR_BK_KUBECONFIG "$CONFIG_DIR/kubekind.yaml"
+      echo "Copied kubeconfig to $CONFIG_DIR/kubekind.yaml"
+    elif [[ ! -f "$(expand_path "$YR_BK_KUBECONFIG")" ]]; then
+      printf 'Kubeconfig path [optional, Enter to skip]: ' >&2
+      IFS= read -r maybe_kube || true
+      if [[ -n "${maybe_kube:-}" ]]; then
+        mkdir -p "$CONFIG_DIR"
+        cp "$maybe_kube" "$CONFIG_DIR/kubekind.yaml"
+        chmod 600 "$CONFIG_DIR/kubekind.yaml"
+        set_config_value YR_BK_KUBECONFIG "$CONFIG_DIR/kubekind.yaml"
+      fi
+    fi
+    if [[ "$want_swr" == true || ( -z "${SWR_USERNAME:-}" && -z "${SWR_PASSWORD:-}" ) ]]; then
+      printf 'Configure SWR now? [y/N]: ' >&2
+      IFS= read -r ans || true
+      if [[ "$ans" =~ ^[Yy] ]]; then
+        printf 'SWR registry [%s]: ' "$SWR_REGISTRY" >&2; IFS= read -r reg || true
+        [[ -n "${reg:-}" ]] && set_config_value SWR_REGISTRY "$reg"
+        printf 'SWR username: ' >&2; IFS= read -r u || true
+        printf 'SWR password/token: ' >&2; stty -echo 2>/dev/null || true; IFS= read -r pw || true; stty echo 2>/dev/null || true; printf '\n' >&2
+        [[ -n "${u:-}" ]] && set_config_value SWR_USERNAME "$u"
+        [[ -n "${pw:-}" ]] && set_config_value SWR_PASSWORD "$pw"
+      fi
+    fi
+  fi
+  load_config
+  validate_config
+}
+
+validate_config() {
+  local ok=0
+  need curl || ok=1
+  need jq || ok=1
+  if [[ -z "${BUILDKITE_API_TOKEN:-}" ]]; then
+    echo "Buildkite: FAILED - missing token. Run yr-bk init"; ok=1
+  else
+    local resp repo
+    resp=$(api_get "$(api_base)" || true)
+    repo=$(jq -r '.repository // empty' <<<"$resp" 2>/dev/null || true)
+    if [[ -n "$repo" ]]; then echo "Buildkite: OK ($YR_BK_ORG/$YR_BK_PIPELINE repo=$repo)"; else echo "Buildkite: FAILED - cannot access $YR_BK_ORG/$YR_BK_PIPELINE"; ok=1; fi
+  fi
+  local kube; kube=$(expand_path "$YR_BK_KUBECONFIG")
+  if [[ -f "$kube" ]]; then
+    if command -v kubectl >/dev/null 2>&1; then
+      if no_proxy_env kubectl --kubeconfig "$kube" get ns --request-timeout=8s >/dev/null 2>&1; then echo "Kubernetes: OK ($kube)"; else echo "Kubernetes: FAILED - kubeconfig exists but kubectl cannot reach cluster"; fi
+    else echo "Kubernetes: SKIPPED - kubectl not installed ($kube exists)"; fi
+  else echo "Kubernetes: SKIPPED (no kubeconfig copied)"; fi
+  if [[ -n "${SWR_USERNAME:-}" && -n "${SWR_PASSWORD:-}" ]]; then
+    command -v docker >/dev/null 2>&1 && echo "SWR: CONFIGURED ($SWR_REGISTRY)" || echo "SWR: SKIPPED - Docker not installed"
+  else echo "SWR: SKIPPED (no credentials configured)"; fi
+  return "$ok"
+}
+
+no_proxy_env() { env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY "$@"; }
+
+resolve_build() {
+  local b="${1:-latest}"
+  if [[ "$b" == "latest" ]]; then
+    [[ -f "$LATEST_FILE" ]] || { echo "No latest build known" >&2; exit 2; }
+    jq -r '.number' "$LATEST_FILE"
+  else
+    printf '%s\n' "$b"
+  fi
+}
+
+save_latest() {
+  local no="$1" url="${2:-}" mode="${3:-}"
+  mkdirs
+  jq -n --arg number "$no" --arg web_url "$url" --arg mode "$mode" --arg ts "$(date -Is)" '{number:($number|tonumber), web_url:$web_url, mode:$mode, saved_at:$ts}' > "$LATEST_FILE"
+}
+
+build_json() { local no; no=$(resolve_build "$1"); api_get "$(api_base)/builds/$no"; }
+terminal_state() { [[ "$1" =~ ^(passed|failed|canceled|blocked|skipped|not_run)$ ]]; }
+active_state() { [[ "$1" =~ ^(creating|scheduled|running|failing|canceling)$ ]]; }
+
+jobs_tsv() {
+  jq -r '.jobs[] | [.name, .state, (.agent.hostname // "-"), (.started_at // "-"), (.finished_at // "-"), (.exit_status|tostring), .id] | @tsv'
+}
+
+cmd_status() {
+  local no info; no=$(resolve_build "${1:-latest}"); info=$(api_get "$(api_base)/builds/$no")
+  jq -r '.state as $s | "build #\(.number) state=\($s) url=\(.web_url)", "branch=\(.branch) commit=\(.commit)", (.jobs[] | [.name, .state, (.agent.hostname // "-"), (.started_at // "-"), (.finished_at // "-"), (.exit_status|tostring)] | @tsv)' <<<"$info"
+}
+
+cmd_jobs() { build_json "${1:-latest}" | jobs_tsv; }
+cmd_running() { build_json "${1:-latest}" | jq -r '.jobs[] | select(.state=="running" or .state=="reserved") | [.name,.state,(.agent.hostname // "-"),.id] | @tsv'; }
+cmd_latest() { [[ -f "$LATEST_FILE" ]] && cat "$LATEST_FILE" | jq . || echo "No latest build known"; }
+
+job_alias_regex() {
+  case "$1" in
+    build-all|build|amd64) echo ':rocket: Build All' ;;
+    rust|rust-e2e) echo ':crab: Rust FunctionSystem E2E' ;;
+    arm|arm64) echo ':penguin: Build All (linux-arm64)' ;;
+    sandbox|package) echo ':package: Package sandbox images and Helm' ;;
+    init) echo ':key: Initialize and Load' ;;
+    pipeline) echo ':pipeline:' ;;
+    *) echo "$1" ;;
+  esac
+}
+
+resolve_job_id() {
+  local build="$1" selector="$2" info target
+  info=$(build_json "$build")
+  if jq -e --arg id "$selector" '.jobs[] | select(.id==$id)' >/dev/null <<<"$info"; then printf '%s\n' "$selector"; return; fi
+  target=$(job_alias_regex "$selector")
+  local id
+  id=$(jq -r --arg n "$target" '.jobs[] | select(.name==$n) | .id' <<<"$info" | head -n1)
+  if [[ -z "$id" ]]; then
+    echo "Job not found: $selector" >&2
+    jq -r '.jobs[] | [.name,.state,.id] | @tsv' <<<"$info" >&2
+    exit 2
+  fi
+  printf '%s\n' "$id"
+}
+
+cmd_log() {
+  local build="${1:-}" selector="${2:-}" tailn=100
+  [[ -n "$build" && -n "$selector" ]] || { echo "Usage: yr-bk log <build|latest> <job> [--tail N]" >&2; exit 2; }
+  shift 2 || true
+  while [[ $# -gt 0 ]]; do case "$1" in --tail) tailn="${2:?}"; shift ;; *) echo "Unknown log option: $1" >&2; exit 2;; esac; shift; done
+  local no id; no=$(resolve_build "$build"); id=$(resolve_job_id "$no" "$selector")
+  curl -fsSL -H "Authorization: Bearer $BUILDKITE_API_TOKEN" "$(api_base)/builds/$no/jobs/$id/log.txt" | tail -n "$tailn"
+}
+
+cmd_cancel() {
+  local no; no=$(resolve_build "${1:-latest}")
+  api_put "$(api_base)/builds/$no/cancel" | jq -r '"build #\(.number) state=\(.state) url=\(.web_url)"'
+}
+
+cmd_watch() {
+  local build="${1:-latest}" interval=60 tailn=40 collect=false job_filter=""
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --interval) interval="${2:?}"; shift ;;
+      --tail) tailn="${2:?}"; shift ;;
+      --collect-on-finish|--collect) collect=true ;;
+      --job) job_filter="${2:?}"; shift ;;
+      *) echo "Unknown watch option: $1" >&2; exit 2 ;;
+    esac
+    shift
+  done
+  local no state info
+  no=$(resolve_build "$build")
+  while true; do
+    info=$(api_get "$(api_base)/builds/$no")
+    state=$(jq -r '.state' <<<"$info")
+    printf '[%s] build #%s state=%s\n' "$(date '+%H:%M:%S')" "$no" "$state"
+    jq -r '.jobs[] | [.name,.state,(.agent.hostname // "-"),(.exit_status|tostring)] | @tsv' <<<"$info"
+    local running_id running_name
+    if [[ -n "$job_filter" ]]; then running_id=$(resolve_job_id "$no" "$job_filter" || true); else running_id=$(jq -r '.jobs[] | select(.state=="running") | .id' <<<"$info" | head -n1); fi
+    if [[ -n "${running_id:-}" && "$running_id" != "null" ]]; then
+      running_name=$(jq -r --arg id "$running_id" '.jobs[] | select(.id==$id) | .name' <<<"$info")
+      echo "--- tail: $running_name ---"
+      curl -fsSL -H "Authorization: Bearer $BUILDKITE_API_TOKEN" "$(api_base)/builds/$no/jobs/$running_id/log.txt" | tail -n "$tailn" || true
+    fi
+    terminal_state "$state" && break
+    sleep "$interval"
+  done
+  [[ "$collect" == true ]] && cmd_collect "$no"
+  [[ "$state" == passed ]]
+}
+
+current_branch() { git rev-parse --abbrev-ref HEAD 2>/dev/null || true; }
+current_commit() { git rev-parse HEAD 2>/dev/null || true; }
+
+cmd_trigger() {
+  local mode="${1:-}"; shift || true
+  [[ "$mode" == "rust-x86" ]] || { echo "Only trigger mode implemented: rust-x86" >&2; exit 2; }
+  local branch="${YR_BK_RUST_BRANCH:-$(current_branch)}" commit="${YR_BK_RUST_COMMIT:-$(current_commit)}" repo="$YR_BK_TARGET_REPO" message="Rust FunctionSystem E2E x86 $(date '+%Y-%m-%d %H:%M:%S')" watch=false collect=false
+  local fs_repo="$YR_BK_FUNCTIONSYSTEM_REPO" fs_branch="$YR_BK_FUNCTIONSYSTEM_BRANCH" image="$YR_BK_RUST_BUILDER_IMAGE"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --branch) branch="${2:?}"; shift ;;
+      --commit) commit="${2:?}"; shift ;;
+      --repo) repo="${2:?}"; shift ;;
+      --message) message="${2:?}"; shift ;;
+      --fs-repo) fs_repo="${2:?}"; shift ;;
+      --fs-branch) fs_branch="${2:?}"; shift ;;
+      --image) image="${2:?}"; shift ;;
+      --watch) watch=true ;;
+      --collect) collect=true; watch=true ;;
+      *) echo "Unknown trigger option: $1" >&2; exit 2 ;;
+    esac
+    shift
+  done
+  [[ -n "$branch" && -n "$commit" ]] || { echo "branch/commit required; run inside repo or pass --branch/--commit" >&2; exit 2; }
+  local pipeline_url original_repo
+  pipeline_url="$(api_base)"
+  original_repo=$(api_get "$pipeline_url" | jq -r '.repository')
+  YR_BK_TRIGGER_PIPELINE_URL="$pipeline_url"
+  YR_BK_TRIGGER_ORIGINAL_REPO="$original_repo"
+  YR_BK_TRIGGER_REPO="$repo"
+  YR_BK_TRIGGER_RESTORED=false
+  restore_repo() {
+    if [[ "${YR_BK_TRIGGER_RESTORED:-true}" == false && -n "${YR_BK_TRIGGER_ORIGINAL_REPO:-}" && "${YR_BK_TRIGGER_ORIGINAL_REPO}" != "${YR_BK_TRIGGER_REPO:-}" ]]; then
+      api_patch "${YR_BK_TRIGGER_PIPELINE_URL}" "$(jq -n --arg repository "${YR_BK_TRIGGER_ORIGINAL_REPO}" '{repository:$repository}')" >/dev/null || true
+      YR_BK_TRIGGER_RESTORED=true
+      echo "Restored Buildkite pipeline repository to ${YR_BK_TRIGGER_ORIGINAL_REPO}"
+    fi
+  }
+  trap restore_repo EXIT
+  if [[ "$original_repo" != "$repo" ]]; then
+    echo "Setting pipeline repository to $repo"
+    api_patch "$pipeline_url" "$(jq -n --arg repository "$repo" '{repository:$repository}')" | jq -r '.repository'
+    # Safe restore requires waiting until terminal; otherwise downstream jobs may checkout old repo.
+    watch=true
+  fi
+  local payload resp no url
+  payload=$(jq -n --arg branch "$branch" --arg commit "$commit" --arg message "$message" --arg fsrepo "$fs_repo" --arg fsbranch "$fs_branch" --arg image "$image" --arg arm "$YR_BK_ENABLE_LINUX_ARM" --arg sandbox "$YR_BK_ENABLE_SANDBOX_PACKAGE" '{branch:$branch,commit:$commit,message:$message,env:{BUILD_TARGET:"linux",ENABLE_RUST_FUNCTIONSYSTEM_ST:"true",ENABLE_LINUX_ARM:$arm,ENABLE_SANDBOX_PACKAGE:$sandbox,FUNCTIONSYSTEM_REPO:$fsrepo,FUNCTIONSYSTEM_BRANCH:$fsbranch,RUST_BUILDER_IMAGE:$image}}')
+  resp=$(api_post "$(api_base)/builds" "$payload")
+  no=$(jq -r '.number // empty' <<<"$resp"); url=$(jq -r '.web_url // empty' <<<"$resp")
+  [[ -n "$no" ]] || { echo "Failed to trigger build" >&2; jq . <<<"$resp" >&2; exit 1; }
+  save_latest "$no" "$url" rust-x86
+  echo "Build #$no started: $url"
+  if [[ "$watch" == true ]]; then
+    if [[ "$collect" == true ]]; then cmd_watch "$no" --collect-on-finish; else cmd_watch "$no"; fi
+  fi
+}
+
+artifact_safe() { local p="$1"; [[ -n "$p" && "$p" != /* && "$p" != ../* && "$p" != *'/../'* && "$p" != *'/..' ]]; }
+
+cmd_artifacts() {
+  local sub="${1:-}" build="${2:-latest}" pattern='*'
+  shift 2 || true
+  while [[ $# -gt 0 ]]; do case "$1" in --pattern) pattern="${2:?}"; shift ;; *) echo "Unknown artifacts option: $1" >&2; exit 2;; esac; shift; done
+  local no arts; no=$(resolve_build "$build"); arts=$(api_get "$(api_base)/builds/$no/artifacts")
+  case "$sub" in
+    list) jq -r '.[] | [.path,.state,(.file_size|tostring),(.job_id // "")] | @tsv' <<<"$arts" ;;
+    download)
+      local root; root="$(expand_path "$YR_BK_ARTIFACT_ROOT")/build-$no/artifacts"; mkdir -p "$root"
+      jq -c '.[] | select(.state=="finished")' <<<"$arts" | while read -r art; do
+        local path url dest
+        path=$(jq -r '.path' <<<"$art"); url=$(jq -r '.download_url' <<<"$art")
+        [[ "$path" == $pattern ]] || continue
+        if ! artifact_safe "$path"; then echo "Skipping unsafe artifact: $path" >&2; continue; fi
+        dest="$root/$path"; mkdir -p "$(dirname "$dest")"
+        curl -fsSL -H "Authorization: Bearer $BUILDKITE_API_TOKEN" -o "$dest" "$url" || true
+        echo "downloaded $path"
+      done
+      ;;
+    *) echo "Usage: yr-bk artifacts list|download <build>" >&2; exit 2 ;;
+  esac
+}
+
+safe_name() { tr -cs 'A-Za-z0-9_.-' '_' <<<"$1" | sed 's/^_//;s/_$//'; }
+
+cmd_collect() {
+  local build="${1:-latest}" pattern='*' no out info arts
+  shift || true
+  while [[ $# -gt 0 ]]; do case "$1" in --pattern) pattern="${2:?}"; shift ;; *) echo "Unknown collect option: $1" >&2; exit 2;; esac; shift; done
+  no=$(resolve_build "$build"); out="$(expand_path "$YR_BK_ARTIFACT_ROOT")/build-$no"
+  mkdir -p "$out/job-logs" "$out/artifacts"
+  info=$(api_get "$(api_base)/builds/$no"); printf '%s\n' "$info" > "$out/build.json"
+  jq -r '.jobs[] | [.id,.name,.state,(.agent.hostname // "-"),(.started_at // "-"),(.finished_at // "-"),(.exit_status|tostring)] | @tsv' <<<"$info" > "$out/jobs.tsv"
+  jq -r '.jobs[] | select(.id and .name) | [.id,.name,.state] | @tsv' <<<"$info" | while IFS=$'\t' read -r id name state; do
+    local file; file="$out/job-logs/$(safe_name "$name")_${state}_${id}.log"
+    curl -fsSL -H "Authorization: Bearer $BUILDKITE_API_TOKEN" "$(api_base)/builds/$no/jobs/$id/log.txt" > "$file" || true
+  done
+  arts=$(api_get "$(api_base)/builds/$no/artifacts"); printf '%s\n' "$arts" > "$out/artifacts.json"
+  jq -c '.[] | select(.state=="finished")' <<<"$arts" | while read -r art; do
+    local path url dest
+    path=$(jq -r '.path' <<<"$art"); url=$(jq -r '.download_url' <<<"$art")
+    [[ "$path" == $pattern ]] || continue
+    artifact_safe "$path" || continue
+    dest="$out/artifacts/$path"; mkdir -p "$(dirname "$dest")"; curl -fsSL -H "Authorization: Bearer $BUILDKITE_API_TOKEN" -o "$dest" "$url" || true
+  done
+  write_summary "$no" "$out"
+  echo "Collected build #$no evidence: $out"
+}
+
+write_summary() {
+  local no="$1" out="$2"
+  {
+    echo "# Buildkite build #$no summary"
+    echo
+    jq -r '"- URL: \(.web_url)\n- State: \(.state)\n- Branch: \(.branch)\n- Commit: \(.commit)"' "$out/build.json"
+    echo
+    echo "## Jobs"
+    echo
+    awk -F '\t' '{printf "- %s: %s host=%s exit=%s\n", $2,$3,$4,$7}' "$out/jobs.tsv"
+    echo
+    echo "## Likely failures"
+    jq -r '.jobs[] | select(.state=="failed" or .state=="failing" or .state=="canceled") | "- " + .name + " state=" + .state + " exit=" + ((.exit_status // "null")|tostring)' "$out/build.json"
+    echo
+    echo "## Artifacts directory"
+    echo "$out/artifacts"
+  } > "$out/summary.md"
+}
+
+cmd_k8s() {
+  local sub="${1:-}"; shift || true
+  local kube; kube=$(expand_path "$YR_BK_KUBECONFIG")
+  [[ -f "$kube" ]] || { echo "Kubernetes config missing. Run: yr-bk init --kubeconfig /path/to/kubekind.yaml" >&2; exit 2; }
+  command -v kubectl >/dev/null 2>&1 || { echo "kubectl missing" >&2; exit 2; }
+  case "$sub" in
+    pods) no_proxy_env kubectl --kubeconfig "$kube" get pods -A -o wide | grep -E 'agent-stack|buildkite|amd64|arm64' || true ;;
+    agent-logs)
+      local arch="${1:-amd64}" pod label
+      if [[ "$arch" == arm64 ]]; then label=agent-stack-k8s-arm64; pod="$YR_BK_AGENT_STACK_ARM64"; else label=agent-stack-k8s; pod="$YR_BK_AGENT_STACK_AMD64"; fi
+      pod=$(no_proxy_env kubectl --kubeconfig "$kube" get pods -n "$YR_BK_K8S_NAMESPACE" -l "app=$label" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || printf '%s' "$pod")
+      [[ -n "$pod" ]] || { echo "No agent-stack pod found for $arch" >&2; exit 2; }
+      no_proxy_env kubectl --kubeconfig "$kube" logs -n "$YR_BK_K8S_NAMESPACE" "$pod" --tail="${2:-200}" ;;
+    logs)
+      local build="${1:?build}" job="${2:?job}" id host
+      id=$(resolve_job_id "$build" "$job")
+      host=$(build_json "$build" | jq -r --arg id "$id" '.jobs[] | select(.id==$id) | .agent.hostname // empty')
+      if [[ -z "$host" ]]; then host=$(no_proxy_env kubectl --kubeconfig "$kube" get pods -n "$YR_BK_K8S_NAMESPACE" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep "^buildkite-${id}" | head -n1 || true); fi
+      [[ -n "$host" ]] || { echo "No pod found for $job ($id)" >&2; exit 2; }
+      no_proxy_env kubectl --kubeconfig "$kube" logs -n "$YR_BK_K8S_NAMESPACE" "$host" --all-containers=true --tail=200 ;;
+    describe)
+      local build="${1:?build}" job="${2:?job}" id host
+      id=$(resolve_job_id "$build" "$job")
+      host=$(build_json "$build" | jq -r --arg id "$id" '.jobs[] | select(.id==$id) | .agent.hostname // empty')
+      if [[ -z "$host" ]]; then host=$(no_proxy_env kubectl --kubeconfig "$kube" get pods -n "$YR_BK_K8S_NAMESPACE" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep "^buildkite-${id}" | head -n1 || true); fi
+      [[ -n "$host" ]] || { echo "No pod found for $job ($id)" >&2; exit 2; }
+      no_proxy_env kubectl --kubeconfig "$kube" describe pod -n "$YR_BK_K8S_NAMESPACE" "$host" ;;
+    *) echo "Usage: yr-bk k8s pods|agent-logs amd64|agent-logs arm64|logs <build> <job>|describe <build> <job>" >&2; exit 2 ;;
+  esac
+}
+
+cmd_vpn() {
+  local sub="${1:-check}"
+  case "$sub" in
+    check)
+      ip -brief addr show "$YR_BK_VPN_INTERFACE" 2>/dev/null || echo "VPN interface missing: $YR_BK_VPN_INTERFACE"
+      ip route | grep -E "${YR_BK_VPN_ALLOWED_IPS//,/|}" || true
+      for h in ${YR_BK_VPN_CHECK_HOSTS//,/ }; do ping -c 1 -W 2 "$h" >/dev/null && echo "ping $h OK" || echo "ping $h FAILED"; done
+      ;;
+    install-plan)
+      cat <<PLAN
+Install WireGuard tools, place config, then bring up VPN:
+  sudo apt-get update && sudo apt-get install -y wireguard-tools resolvconf
+  mkdir -p ~/.config/yr-buildkite
+  cp <wg0.conf> $YR_BK_VPN_CONFIG
+  chmod 600 $YR_BK_VPN_CONFIG
+  sudo cp $YR_BK_VPN_CONFIG /etc/wireguard/$YR_BK_VPN_INTERFACE.conf
+  sudo chmod 600 /etc/wireguard/$YR_BK_VPN_INTERFACE.conf
+  sudo wg-quick up $YR_BK_VPN_INTERFACE
+
+Current editable defaults:
+  interface=$YR_BK_VPN_INTERFACE
+  endpoint=$YR_BK_VPN_ENDPOINT
+  address=$YR_BK_VPN_ADDRESS
+  allowed_ips=$YR_BK_VPN_ALLOWED_IPS
+PLAN
+      ;;
+    up) sudo wg-quick up "$YR_BK_VPN_INTERFACE" ;;
+    down) sudo wg-quick down "$YR_BK_VPN_INTERFACE" ;;
+    *) echo "Usage: yr-bk vpn check|install-plan|up|down" >&2; exit 2 ;;
+  esac
+}
+
+cmd_image() {
+  local sub="${1:-}" image="${2:-}"
+  [[ -n "$sub" && -n "$image" ]] || { echo "Usage: yr-bk image check|manifest|smoke IMAGE" >&2; exit 2; }
+  case "$sub" in
+    check|manifest) docker buildx imagetools inspect "$image" ;;
+    smoke) docker run --rm --pull=always "$image" bash -lc 'rustc --version 2>/dev/null || true; cargo --version 2>/dev/null || true; gcc --version | head -1; cmake --version | head -1' ;;
+    *) echo "Usage: yr-bk image check|manifest|smoke IMAGE" >&2; exit 2 ;;
+  esac
+}
+
+cmd_config() {
+  local sub="${1:-show}"
+  case "$sub" in
+    path) printf 'runtime=%s\nlocal=%s\n' "$CONFIG_FILE" "$LOCAL_CONFIG_FILE" ;;
+    edit) "${EDITOR:-vi}" "$CONFIG_FILE" ;;
+    show)
+      if [[ -f "$CONFIG_FILE" ]]; then echo "# $CONFIG_FILE"; cat "$CONFIG_FILE" | redact; else echo "No config file yet: $CONFIG_FILE"; fi
+      if [[ -f "$LOCAL_CONFIG_FILE" ]]; then echo "# $LOCAL_CONFIG_FILE"; cat "$LOCAL_CONFIG_FILE" | redact; else echo "No local migration config yet: $LOCAL_CONFIG_FILE"; fi
+      echo "Run: yr-bk init"
+      ;;
+    *) echo "Usage: yr-bk config path|edit|show" >&2; exit 2 ;;
+  esac
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    -h|--help|help|'') usage ;;
+    init) cmd_init "$@" ;;
+    config) cmd_config "$@" ;;
+    validate-only) cmd_init --validate-only ;;
+    status) cmd_status "$@" ;;
+    jobs) cmd_jobs "$@" ;;
+    running) cmd_running "$@" ;;
+    latest) cmd_latest ;;
+    cancel) cmd_cancel "$@" ;;
+    watch) cmd_watch "$@" ;;
+    log) cmd_log "$@" ;;
+    trigger) cmd_trigger "$@" ;;
+    artifacts) cmd_artifacts "$@" ;;
+    collect) cmd_collect "$@" ;;
+    k8s) cmd_k8s "$@" ;;
+    vpn) cmd_vpn "$@" ;;
+    image) cmd_image "$@" ;;
+    *) echo "Unknown command: $cmd" >&2; usage >&2; exit 2 ;;
+  esac
+}
+main "$@"
