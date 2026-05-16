@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""Tailscale node discovery plus SSH/rsync helpers."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+CONFIG_PATH = Path.home() / ".config" / "tailscale-remote" / "config.json"
+DANGEROUS_TOKENS = (
+    "rm -rf",
+    "mkfs",
+    "dd if=",
+    ":(){",
+    "shutdown",
+    "reboot",
+    "halt",
+    "poweroff",
+    "diskutil erase",
+    "sudo rm",
+)
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def run_capture(cmd: list[str]) -> str:
+    try:
+        proc = subprocess.run(cmd, check=True, text=True, capture_output=True)
+    except FileNotFoundError:
+        fail(f"missing command: {cmd[0]}")
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        if detail:
+            fail(f"{' '.join(cmd)} failed: {detail}")
+        fail(f"{' '.join(cmd)} failed with exit code {exc.returncode}")
+    return proc.stdout
+
+
+def run_passthrough(cmd: list[str]) -> int:
+    try:
+        return subprocess.run(cmd).returncode
+    except FileNotFoundError:
+        fail(f"missing command: {cmd[0]}")
+
+
+def load_config() -> dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except json.JSONDecodeError as exc:
+        fail(f"invalid config {CONFIG_PATH}: {exc}")
+
+
+def tailscale_status() -> dict[str, Any]:
+    raw = run_capture(["tailscale", "status", "--json"])
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        fail(f"tailscale status returned invalid JSON: {exc}")
+
+
+def collect_nodes(status: dict[str, Any]) -> list[dict[str, Any]]:
+    nodes: list[dict[str, Any]] = []
+
+    self_node = status.get("Self")
+    if isinstance(self_node, dict):
+        node = dict(self_node)
+        node["_key"] = "self"
+        nodes.append(node)
+
+    peers = status.get("Peer") or {}
+    if isinstance(peers, dict):
+        for key, peer in peers.items():
+            if isinstance(peer, dict):
+                node = dict(peer)
+                node["_key"] = key
+                nodes.append(node)
+
+    return nodes
+
+
+def node_names(node: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for key in ("HostName", "DNSName"):
+        value = node.get(key)
+        if isinstance(value, str) and value:
+            names.append(value.rstrip("."))
+    for ip in node.get("TailscaleIPs") or []:
+        if isinstance(ip, str):
+            names.append(ip)
+    return names
+
+
+def node_destination(node: dict[str, Any]) -> str:
+    dns = node.get("DNSName")
+    if isinstance(dns, str) and dns:
+        return dns.rstrip(".")
+    ips = node.get("TailscaleIPs") or []
+    if ips:
+        return str(ips[0])
+    fail(f"node has no usable Tailscale address: {node.get('HostName') or node.get('_key')}")
+
+
+def resolve_target(target: str, config: dict[str, Any] | None = None) -> tuple[str, dict[str, Any] | None]:
+    config = config or load_config()
+    aliases = config.get("aliases") or {}
+    if isinstance(aliases, dict) and target in aliases:
+        target = str(aliases[target])
+
+    status = tailscale_status()
+    nodes = collect_nodes(status)
+
+    exact_matches: list[dict[str, Any]] = []
+    prefix_matches: list[dict[str, Any]] = []
+    needle = target.rstrip(".").lower()
+
+    for node in nodes:
+        names = [name.lower().rstrip(".") for name in node_names(node)]
+        if needle in names:
+            exact_matches.append(node)
+            continue
+        for name in names:
+            if name.startswith(needle):
+                prefix_matches.append(node)
+                break
+
+    matches = exact_matches or prefix_matches
+    unique = {node.get("_key") or node_destination(node): node for node in matches}
+    if len(unique) == 1:
+        node = next(iter(unique.values()))
+        return node_destination(node), node
+    if len(unique) > 1:
+        print("multiple Tailscale nodes match:", file=sys.stderr)
+        for node in unique.values():
+            print(format_node(node), file=sys.stderr)
+        fail("use a more specific hostname, MagicDNS name, or Tailscale IP")
+
+    return target, None
+
+
+def format_node(node: dict[str, Any]) -> str:
+    hostname = node.get("HostName") or "-"
+    dns = str(node.get("DNSName") or "-").rstrip(".")
+    ips = ",".join(str(ip) for ip in (node.get("TailscaleIPs") or [])) or "-"
+    online = "online" if node.get("Online") else "offline"
+    os_name = node.get("OS") or "-"
+    user = node.get("User") or "-"
+    return f"{hostname}\t{dns}\t{ips}\t{online}\t{os_name}\t{user}"
+
+
+def effective_user(args: argparse.Namespace, config: dict[str, Any]) -> str | None:
+    return args.user or config.get("default_user") or os.environ.get("TS_REMOTE_USER")
+
+
+def ssh_target(destination: str, user: str | None) -> str:
+    return f"{user}@{destination}" if user else destination
+
+
+def ensure_command(command: str) -> None:
+    if shutil.which(command) is None:
+        fail(f"missing command: {command}")
+
+
+def require_safe_command(command: str, all_nodes: bool, assume_yes: bool) -> None:
+    lowered = command.lower()
+    dangerous = any(token in lowered for token in DANGEROUS_TOKENS)
+    if dangerous and all_nodes:
+        fail("refusing to run a dangerous-looking command across all nodes")
+    if dangerous and not assume_yes:
+        fail("dangerous-looking command requires --yes after explicit user confirmation")
+
+
+def cmd_nodes(_args: argparse.Namespace) -> int:
+    status = tailscale_status()
+    print("HOSTNAME\tDNS\tTAILSCALE_IPS\tSTATE\tOS\tUSER")
+    for node in collect_nodes(status):
+        print(format_node(node))
+    return 0
+
+
+def cmd_resolve(args: argparse.Namespace) -> int:
+    destination, node = resolve_target(args.target)
+    if node:
+        print(format_node(node), file=sys.stderr)
+    print(destination)
+    return 0
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    config = load_config()
+    destination, node = resolve_target(args.target, config)
+    user = effective_user(args, config)
+    print(f"target: {ssh_target(destination, user)}")
+    if node:
+        print(f"node: {format_node(node)}")
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", ssh_target(destination, user), "echo ok"]
+    return run_passthrough(cmd)
+
+
+def cmd_setup_key(args: argparse.Namespace) -> int:
+    ensure_command("ssh-copy-id")
+    config = load_config()
+    destination, node = resolve_target(args.target, config)
+    user = effective_user(args, config)
+    target = ssh_target(destination, user)
+    key_path = Path(args.key).expanduser()
+    if not key_path.exists():
+        print(f"creating SSH key: {key_path}")
+        rc = run_passthrough(["ssh-keygen", "-t", "ed25519", "-f", str(key_path), "-N", "", "-C", "tailscale-remote"])
+        if rc != 0:
+            return rc
+    print(f"installing SSH key on: {target}")
+    if node:
+        print(f"node: {format_node(node)}")
+    rc = run_passthrough(["ssh-copy-id", "-i", f"{key_path}.pub", target])
+    if rc != 0:
+        return rc
+    print("verifying key login")
+    return run_passthrough(["ssh", "-o", "BatchMode=yes", target, "echo ok"])
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    parsed = parse_run_tokens(args.tokens, args.all, args.user, args.yes)
+    args.target = parsed["target"]
+    args.all = parsed["all"]
+    args.user = parsed["user"]
+    args.yes = parsed["yes"]
+    args.command = parsed["command"]
+
+    config = load_config()
+    user = effective_user(args, config)
+    command = " ".join(args.command).strip()
+    if not command:
+        fail("missing remote command after --")
+    require_safe_command(command, args.all, args.yes)
+
+    if args.all:
+        status = tailscale_status()
+        nodes = [node for node in collect_nodes(status) if node.get("Online")]
+        rc = 0
+        for node in nodes:
+            destination = node_destination(node)
+            target = ssh_target(destination, user)
+            print(f"\n==> {target} ({node.get('HostName') or '-'})")
+            node_rc = run_passthrough(["ssh", target, command])
+            rc = rc or node_rc
+        return rc
+
+    destination, node = resolve_target(args.target, config)
+    target = ssh_target(destination, user)
+    print(f"target: {target}")
+    if node:
+        print(f"node: {format_node(node)}")
+    return run_passthrough(["ssh", target, command])
+
+
+def parse_run_tokens(tokens: list[str], all_nodes: bool, user: str | None, yes: bool) -> dict[str, Any]:
+    target: str | None = None
+    command: list[str] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "--":
+            command = tokens[i + 1 :]
+            break
+        if token == "--all":
+            all_nodes = True
+            i += 1
+            continue
+        if token == "--yes":
+            yes = True
+            i += 1
+            continue
+        if token == "--user":
+            if i + 1 >= len(tokens):
+                fail("--user requires a value")
+            user = tokens[i + 1]
+            i += 2
+            continue
+        if token.startswith("--user="):
+            user = token.split("=", 1)[1]
+            i += 1
+            continue
+        if token.startswith("--"):
+            fail(f"unknown run option: {token}")
+        if target is None:
+            target = token
+            i += 1
+            continue
+        command = tokens[i:]
+        break
+
+    if all_nodes and target:
+        fail("use either TARGET or --all, not both")
+    if not all_nodes and not target:
+        fail("run requires TARGET unless --all is used")
+    if not command:
+        fail("missing remote command after --")
+
+    return {"target": target, "user": user, "all": all_nodes, "yes": yes, "command": command}
+
+
+def copy_tool() -> str:
+    if shutil.which("rsync"):
+        return "rsync"
+    if shutil.which("scp"):
+        return "scp"
+    fail("missing both rsync and scp")
+
+
+def cmd_upload(args: argparse.Namespace) -> int:
+    config = load_config()
+    destination, node = resolve_target(args.target, config)
+    user = effective_user(args, config)
+    remote = f"{ssh_target(destination, user)}:{args.remote_path}"
+    print(f"upload: {args.local_path} -> {remote}")
+    if node:
+        print(f"node: {format_node(node)}")
+    if copy_tool() == "rsync":
+        return run_passthrough(["rsync", "-azP", args.local_path, remote])
+    return run_passthrough(["scp", "-r", args.local_path, remote])
+
+
+def cmd_download(args: argparse.Namespace) -> int:
+    config = load_config()
+    destination, node = resolve_target(args.target, config)
+    user = effective_user(args, config)
+    remote = f"{ssh_target(destination, user)}:{args.remote_path}"
+    print(f"download: {remote} -> {args.local_path}")
+    if node:
+        print(f"node: {format_node(node)}")
+    if copy_tool() == "rsync":
+        return run_passthrough(["rsync", "-azP", remote, args.local_path])
+    return run_passthrough(["scp", "-r", remote, args.local_path])
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Tailscale remote SSH and file copy helper")
+    sub = parser.add_subparsers(dest="command_name", required=True)
+
+    p = sub.add_parser("nodes", help="list visible Tailscale nodes")
+    p.set_defaults(func=cmd_nodes)
+
+    p = sub.add_parser("resolve", help="resolve a hostname, alias, MagicDNS name, or Tailscale IP")
+    p.add_argument("target")
+    p.set_defaults(func=cmd_resolve)
+
+    p = sub.add_parser("check", help="check SSH key access")
+    p.add_argument("target")
+    p.add_argument("--user")
+    p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("setup-key", help="install local SSH public key on a target")
+    p.add_argument("target")
+    p.add_argument("--user")
+    p.add_argument("--key", default="~/.ssh/id_ed25519")
+    p.set_defaults(func=cmd_setup_key)
+
+    p = sub.add_parser("run", help="run a remote command")
+    p.add_argument("--all", action="store_true", help="run on all online nodes")
+    p.add_argument("--user")
+    p.add_argument("--yes", action="store_true", help="allow a dangerous-looking single-target command")
+    p.add_argument("tokens", nargs=argparse.REMAINDER, help="TARGET/--all, options, then remote command after --")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("upload", help="copy local path to remote target")
+    p.add_argument("target")
+    p.add_argument("local_path")
+    p.add_argument("remote_path")
+    p.add_argument("--user")
+    p.set_defaults(func=cmd_upload)
+
+    p = sub.add_parser("download", help="copy remote path from target to local path")
+    p.add_argument("target")
+    p.add_argument("remote_path")
+    p.add_argument("local_path")
+    p.add_argument("--user")
+    p.set_defaults(func=cmd_download)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

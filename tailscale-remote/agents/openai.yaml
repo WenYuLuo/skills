@@ -1,0 +1,7 @@
+interface:
+  display_name: "Tailscale Remote"
+  short_description: "Run commands and copy files over Tailscale."
+  default_prompt: "Use $tailscale-remote to list my Tailscale nodes and help me run a remote command or copy files."
+
+policy:
+  allow_implicit_invocation: true
