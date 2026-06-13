@@ -18,6 +18,15 @@ Python `yr` SDK, and the runtime image — a full control plane you can invoke a
 The two stacks are **decoupled** — same external behavior, different functionsystem
 binaries. Pick by what you are validating: `cpp` for the oracle, `rust` for the rewrite.
 
+**Containers are disposable** — `yr-aio.sh up` recreates a fresh one from the image in
+~1 command (≈1–2 min to ready). Never treat a long-lived container as the source of
+truth; the **images** are. If an image itself is missing, rebuild it: the build chain
+(base → controlplane → aio) and the Rust-wheel repack recipe live in
+`~/workspace/code/yr-rust/aio-verify/README.md` (§"镜像构建溯源") and
+`~/workspace/code/yr-rust/aio-build/` (build scripts + evidence). `yuanrong-aio:cpp`
+comes from the C++ `feature/sandbox` AIO build; `yuanrong-aio:rust` from the same chain
+with the 4 Rust functionsystem bins repacked into the openyuanrong wheel.
+
 All commands go through `scripts/yr-aio.sh` (set `SKILL_DIR` to this skill's dir, or
 call it by path). Inside a container the cluster front door is **`127.0.0.1:8888`**
 (traefik → frontend `8889`).
