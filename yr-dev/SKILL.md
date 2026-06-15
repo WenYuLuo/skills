@@ -1,11 +1,19 @@
 ---
 name: yr-dev
-description: Use when working on openYuanrong repositories and needing project-specific development, build, and GitCode workflow reference
+description: Use when working on openYuanrong repositories and needing project-specific development, network-stable builds, dependency download/cache diagnostics, and GitCode workflow reference
 ---
 
 # yr-dev: openYuanrong 开发辅助
 
 协助 openYuanrong 项目开发的参考信息与工具。
+
+## 网络稳定编译
+
+当用户在 openYuanrong/YuanRong 仓库中排查或执行编译，且问题涉及华为云/Gitee/镜像源、apt/pip/uv/Go/npm/Maven/Bazel/Cargo/Docker 下载、`datasystem`/`functionsystem`/`frontend`/`yuanrong` 构建稳定性时，先阅读：
+
+- `references/build-network-robustness.md` — 编译容器网络、动态环境注入、缓存/预热、清理边界和各子系统根因知识。
+
+默认原则：不改项目构建行为；优先在调用者当前工作目录下使用 `.yr-cache/` 和动态环境变量；编译容器优先使用 `--network host` 验证/执行国内镜像访问；不要把 AI/国外代理全局强加给国内源；不要猜测“华为云挂了”，先区分宿主机、Docker NAT、容器网络和具体下载工具。
 
 ## GitCode 平台
 
