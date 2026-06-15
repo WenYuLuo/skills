@@ -1,6 +1,6 @@
 ---
 name: yr-smoke-aio
-description: Use to stand up a self-contained LOCAL multi-node openYuanRong cluster (master + data-plane workers, each a privileged AIO container with in-container dockerd/runc runtimes) and run the Python actor SMOKE suite against the Rust-rewrite functionsystem — build the image (AIO base + current rust trio), deploy the cluster, pull/refresh cases, run isolated, collect pass/fail. For cluster smoke verification with fast local iteration; complements yuanrong-aio (single-container simple commands) and yr-process-smoke (remote 3-node cluster).
+description: Use to stand up a self-contained LOCAL multi-node openYuanRong cluster (master + data-plane workers, each a privileged AIO container with in-container dockerd/runc runtimes) and run the Python actor SMOKE suite against the Rust-rewrite functionsystem — build the image (AIO base + current rust binaries built via yr-dev), deploy the cluster, pull/refresh cases, run isolated, collect pass/fail. For cluster smoke verification with fast local iteration; complements yuanrong-aio (single-container simple commands) and yr-process-smoke (remote 3-node cluster).
 ---
 
 # yr-smoke-aio: local multi-node openYuanRong cluster smoke
@@ -9,42 +9,45 @@ Stand up a faithful **multi-node** openYuanRong cluster on one machine — 1 mas
 workers, each a privileged AIO container (in-container dockerd + containerd, functionsystem,
 runtime-launcher, traefik, the `yr` SDK, runtime image) — then run the real Python actor smoke
 cases against it. Lets you reproduce remote 3-node behaviours and validate Rust functionsystem
-fixes with **minutes-level** iteration (compile trio ~40-90s, redeploy ~1-2min) instead of the
+fixes with **minutes-level** iteration (compile ~40-90s via yr-dev, redeploy ~1-2min) instead of the
 ~55min remote fat-wheel build.
 
 `scripts/yr-smoke-aio.sh` is the orchestrator (run with no args for usage).
 
 ## Dependencies (honest)
 - **GitCode token** — one token covers both the smoke **cases** (OpenYuanRongTest) and the **rust
-  source** (`yuanrong-functionsystem @ rust-rewrite-sandbox`) you compile the trio from.
+  source** (`yuanrong-functionsystem @ rust-rewrite-sandbox`) you build the binaries from (via yr-dev).
 - **Two Docker images** (NOT pulled by a token):
   - AIO **base** image (default `yuanrong-aio:rust`, ~4GB) — the full single-container stack.
   - A **compile** image (default `compile-ubuntu2004-rust:arm64`) — cargo + protoc, arch/glibc-matched.
   - If you DON'T have them, `build-image`/`build-bins` print build guidance. The base can be built
     from the monorepo `deploy/sandbox/docker/build-images.sh` (the aio target) or loaded from a
     shared tarball; the full wheel build may need network not always available, so a prebuilt
-    base tarball is the easy path. The compile image = any arm64 ubuntu:22.04 + rustup + protobuf-compiler.
+    base tarball is the easy path. (The compile image is yr-dev's concern; any arm64 ubuntu:22.04 + rustup + protobuf-compiler works.)
 - Network for `pip` (numpy/pydantic/fastapi/xlwt…) is assumed.
 
-**Consistency rule (why it works):** compile image and AIO base must share arch + OS + glibc + python
-(verified: arm64 / Ubuntu 22.04.5 / glibc 2.35 / cpython-3.10). A trio binary built in the compile
-container then runs unchanged in the AIO containers. This is a **language replacement** — when fixing
-any bug/feature in the rust trio, mirror the C++ baseline (openYuanRong `feature/sandbox`), don't invent.
+**Compilation is NOT this skill's job.** Build the 4 binaries (function_master/proxy/agent +
+domain_scheduler) with the **yr-dev** skill (network-stable Cargo build in the compile image,
+`.yr-cache`, dynamic env per `yr-dev/references/build-network-robustness.md`), then feed
+`<rust-src>/target/release` to `build-image`. **Consistency rule:** the compile image and AIO base
+must share arch + OS + glibc + python (verified: arm64 / Ubuntu 22.04.5 / glibc 2.35 / cpython-3.10)
+so binaries run unchanged in the AIO. **Language replacement** — when fixing any bug/feature in the
+rust binaries, mirror the C++ baseline (openYuanRong `feature/sandbox`), don't invent.
 
 ## Workflow
 ```bash
 S=scripts/yr-smoke-aio.sh
-# 1. compile the rust trio (function_master/proxy/agent) from your rust-rewrite-sandbox checkout
-$S build-bins  ~/src/yuanrong-functionsystem            # -> <src>/target/release/{function_master,...}
-# 2. bake trio + smoke config into an image FROM the AIO base
+# 0. (yr-dev) compile the 4 binaries from your rust-rewrite-sandbox checkout -> <src>/target/release
+#    function_master / function_proxy / function_agent / domain_scheduler
+# 1. bake the 4 binaries + smoke config into an image FROM the AIO base
 $S build-image ~/src/yuanrong-functionsystem/target/release  yuanrong-aio:rust  yr-smoke-aio:local
-# 3. deploy master + 2 workers (3-node)
+# 2. deploy master + 2 workers (3-node)
 $S up          yr-smoke-aio:local  3
-# 4. pull the smoke cases (set YR_SMOKE_CASES_REPO to your repo url, or edit fetch-cases)
+# 3. pull the smoke cases (set YR_SMOKE_CASES_REPO to your repo url, or edit fetch-cases)
 $S fetch-cases <GITCODE_TOKEN>  ~/yr-smoke-cases
-# 5. load cases + deps + driver config.ini into the master
+# 4. load cases + deps + driver config.ini into the master
 $S prepare     ~/yr-smoke-cases/FunctionSystemTest/cases/python-actor
-# 6. run the suite isolated (optional pytest filename filter), get pass/fail summary
+# 5. run the suite isolated (optional pytest filename filter), get pass/fail summary
 $S run                                                   # all; or:  $S run 'test_yr_resource|test_actor'
 $S status      # node_count + containers
 $S down        # teardown

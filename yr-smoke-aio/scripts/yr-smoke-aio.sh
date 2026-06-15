@@ -3,16 +3,18 @@
 # run the Python actor smoke suite against it. One privileged container per node
 # (master + data-plane workers), each with in-container dockerd (runc runtimes).
 #
-#   yr-smoke-aio.sh build-bins  <rust-src> [compile-image]   # compile function_master/proxy/agent (arm64)
-#   yr-smoke-aio.sh build-image <bins-dir> [base-image] [tag] # bake trio+config into a smoke image
+#   yr-smoke-aio.sh build-image <bins-dir> [base-image] [tag] # bake bins+config into a smoke image
 #   yr-smoke-aio.sh up          [tag] [nodes]                # deploy master + (nodes-1) workers
 #   yr-smoke-aio.sh fetch-cases <gitcode-token> [dest]       # clone/update the smoke case repo
 #   yr-smoke-aio.sh prepare     <cases-dir>                  # load cases + deps + config.ini into master
 #   yr-smoke-aio.sh run         [pytest-filter]              # isolated smoke run + pass/fail summary
 #   yr-smoke-aio.sh status | down
 #
-# Env consistency: build-bins' compile image MUST match the AIO base (same arch + glibc;
-# verified: arm64 / Ubuntu 22.04.5 / glibc 2.35 / cpython-3.10). A binary built there runs in the AIO.
+# COMPILATION IS NOT THIS SKILL'S JOB — build the 4 binaries (function_master/proxy/agent +
+# domain_scheduler) via the **yr-dev** skill (network-stable Cargo build in the compile image,
+# .yr-cache, dynamic env), then point `build-image` at <rust-src>/target/release.
+# Env consistency: the compile image MUST match the AIO base (same arch + glibc; verified:
+# arm64 / Ubuntu 22.04.5 / glibc 2.35 / cpython-3.10) so the binaries run unchanged in the AIO.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,31 +28,11 @@ MASTER_INFO_FILE=/tmp/yr_sessions/latest/master.info
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
 
-# --- compile the rust trio (function_master/proxy/agent) in a toolchain-matched container ---
-cmd_build_bins(){
-  local src="${1:?rust functionsystem source dir (checkout of rust-rewrite-sandbox)}"
-  local img="${2:-compile-ubuntu2004-rust:arm64}"
-  [ -d "$src" ] || die "no such rust source dir: $src"
-  docker image inspect "$img" >/dev/null 2>&1 || die "compile image '$img' not found.
-  Build/obtain a toolchain image matching the AIO base (arm64 / Ubuntu 22.04.5 / glibc 2.35,
-  with cargo + protoc). The AIO image's own build toolchain works; otherwise any
-  ubuntu:22.04 arm64 + rustup + protobuf-compiler will do."
-  echo "[build-bins] compiling function_master/proxy/agent from $src ..."
-  docker rm -f yr-smoke-build >/dev/null 2>&1 || true
-  docker run -d --name yr-smoke-build -v "$src:/workspace" "$img" sleep infinity >/dev/null
-  docker exec yr-smoke-build bash -lc '
-    cd /workspace && export PROTOC=$(command -v protoc || echo /usr/bin/protoc)
-    cargo build --release --bin function_master --bin function_proxy --bin function_agent' \
-    || die "cargo build failed (see compile container output)"
-  echo "[build-bins] done. binaries at: $src/target/release/{function_master,function_proxy,function_agent}"
-  docker rm -f yr-smoke-build >/dev/null 2>&1 || true
-}
-
-# --- bake trio + config + master start-script into a smoke image ---
+# --- bake the 4 prebuilt binaries + config + master start-script into a smoke image ---
 cmd_build_image(){
-  local bins="${1:?dir containing function_master/proxy/agent (e.g. <rust-src>/target/release)}"
+  local bins="${1:?dir containing function_master/proxy/agent/domain_scheduler (e.g. <rust-src>/target/release)}"
   local base="${2:-$DEFAULT_BASE}"; local tag="${3:-$DEFAULT_TAG}"
-  for b in function_master function_proxy function_agent; do [ -f "$bins/$b" ] || die "missing $bins/$b (run build-bins first)"; done
+  for b in function_master function_proxy function_agent domain_scheduler; do [ -f "$bins/$b" ] || die "missing $bins/$b (build the 4 binaries via the yr-dev skill first)"; done
   if ! docker image inspect "$base" >/dev/null 2>&1; then
     die "base AIO image '$base' not found.
   The base bundles dockerd+containerd, functionsystem, runtime-launcher, traefik, the yr SDK
@@ -59,7 +41,7 @@ cmd_build_image(){
   Network for the full wheel build may be restricted; a prebuilt base tarball is the easy path."
   fi
   local ctx; ctx="$(mktemp -d)"
-  cp "$bins"/function_master "$bins"/function_proxy "$bins"/function_agent "$ctx/"
+  cp "$bins"/function_master "$bins"/function_proxy "$bins"/function_agent "$bins"/domain_scheduler "$ctx/"
   cp "$TPL/init_scheduler_args.json" "$TPL/start-master.sh" "$ctx/"
   sed "s|__BASE__|$base|" "$TPL/Dockerfile" > "$ctx/Dockerfile"
   echo "[build-image] FROM $base -> $tag"
@@ -152,7 +134,6 @@ cmd_status(){
 cmd_down(){ docker rm -f "$MASTER" >/dev/null 2>&1 || true; for i in $(seq 1 9); do docker rm -f "${WPREFIX}${i}" >/dev/null 2>&1 || true; done; echo "torn down"; }
 
 case "${1:-}" in
-  build-bins)  shift; cmd_build_bins "$@" ;;
   build-image) shift; cmd_build_image "$@" ;;
   up)          shift; cmd_up "$@" ;;
   fetch-cases) shift; cmd_fetch_cases "$@" ;;
