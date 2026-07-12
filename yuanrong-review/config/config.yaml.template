@@ -2,7 +2,7 @@
 # Do not commit files containing real tokens.
 
 api:
-  base_url: "https://api.gitcode.com/api/v5"
+  base_url: "https://gitcode.com/api/v5"
   access_token: "${YUANRONG_PAT}"
 
 defaults:

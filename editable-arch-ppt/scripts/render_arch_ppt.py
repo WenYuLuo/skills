@@ -12,7 +12,8 @@ import json
 import sys
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+import math
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
@@ -224,6 +225,91 @@ def _box_label(box: Dict[str, Any], idx: int) -> str:
     return text[:48] or f"box#{idx}"
 
 
+def _text_units(text: str) -> float:
+    """Approximate rendered width in font-size units.
+
+    Latin characters are usually narrower than CJK. This is a conservative
+    preflight check, not a replacement for visual review.
+    """
+    total = 0.0
+    for ch in text:
+        if ch == "\n":
+            continue
+        if ch.isspace():
+            total += 0.35
+        elif ord(ch) < 128:
+            total += 0.58
+        else:
+            total += 1.0
+    return total
+
+
+def _lint_text_fit(items: Iterable[Dict[str, Any]], kind: str, warnings: List[Dict[str, Any]]) -> None:
+    for idx, item in enumerate(items, start=1):
+        text = str(item.get("text", "")).strip()
+        if not text:
+            continue
+        w = float(item.get("w", 0))
+        h = float(item.get("h", 0))
+        font_size = float(item.get("font_size", 9))
+        usable_w = max(0.1, w - 0.16)
+        usable_h = max(0.1, h - 0.10)
+        units_per_line = max(1.0, usable_w * 72.0 / (font_size * 0.58))
+        explicit_lines = text.splitlines() or [text]
+        needed_lines = 0
+        for line in explicit_lines:
+            needed_lines += max(1, math.ceil(_text_units(line) / units_per_line))
+        max_lines = max(1, math.floor(usable_h * 72.0 / (font_size * 1.25)))
+        label = _box_label(item, idx)
+        if needed_lines > max_lines:
+            warnings.append({
+                "item": f"{kind}#{idx}",
+                "issue": "text_overflow_risk",
+                "label": label,
+                "font_size": font_size,
+                "needed_lines": needed_lines,
+                "max_lines": max_lines,
+            })
+        if kind == "box" and ("\n" in text or len(text) > 34) and font_size >= 11:
+            warnings.append({
+                "item": f"{kind}#{idx}",
+                "issue": "component_label_too_dense",
+                "label": label,
+                "font_size": font_size,
+                "guidance": "Use short name in the component box; move details to a note box.",
+            })
+
+
+def _endpoint_contact(point: Tuple[float, float], box: Dict[str, Any], clearance: float) -> Optional[str]:
+    x, y = point
+    rx, ry = float(box["x"]), float(box["y"])
+    rw, rh = float(box["w"]), float(box["h"])
+    tol = max(0.05, clearance * 0.45)
+    within_y = ry - tol <= y <= ry + rh + tol
+    within_x = rx - tol <= x <= rx + rw + tol
+    contacts: List[Tuple[float, str]] = []
+    if within_y:
+        contacts.append((abs(x - rx), "left"))
+        contacts.append((abs(x - (rx + rw)), "right"))
+    if within_x:
+        contacts.append((abs(y - ry), "top"))
+        contacts.append((abs(y - (ry + rh)), "bottom"))
+    contacts = [(d, side) for d, side in contacts if d <= tol]
+    if not contacts:
+        return None
+    return min(contacts)[1]
+
+
+def _segment_orientation(p1: Tuple[float, float], p2: Tuple[float, float]) -> str:
+    x1, y1 = p1
+    x2, y2 = p2
+    if abs(x1 - x2) < 1e-6:
+        return "vertical"
+    if abs(y1 - y2) < 1e-6:
+        return "horizontal"
+    return "diagonal"
+
+
 def lint_spec(spec: Dict[str, Any], clearance: float = 0.18) -> Dict[str, Any]:
     """Detect route segments that are likely to cross or visually hug modules.
 
@@ -240,9 +326,53 @@ def lint_spec(spec: Dict[str, Any], clearance: float = 0.18) -> Dict[str, Any]:
         boxes.append((idx, item))
 
     warnings: List[Dict[str, Any]] = []
+    _lint_text_fit(spec.get("boxes", []), "box", warnings)
+    _lint_text_fit(spec.get("texts", []), "text", warnings)
+
     edge_tol = float(spec.get("edge_hug_tolerance", 0.04))
     for flow_idx, flow in enumerate(spec.get("flows", []), start=1):
         points = flow.get("points", [])
+        if len(points) >= 2:
+            flow_name = flow.get("id") or f"flow#{flow_idx}"
+            start = tuple(map(float, points[0]))
+            end = tuple(map(float, points[-1]))
+            first_orientation = _segment_orientation(tuple(map(float, points[0])), tuple(map(float, points[1])))
+            last_orientation = _segment_orientation(tuple(map(float, points[-2])), tuple(map(float, points[-1])))
+            for endpoint_name, point, orientation, arrow_enabled in [
+                ("start", start, first_orientation, bool(flow.get("begin_arrow"))),
+                ("end", end, last_orientation, bool(flow.get("end_arrow", True))),
+            ]:
+                if endpoint_name == "start" and not arrow_enabled:
+                    # The non-arrow source may use a short external port/stub.
+                    continue
+                contacts = []
+                for box_idx, b in boxes:
+                    side = _endpoint_contact(point, b, clearance)
+                    if side:
+                        contacts.append((_box_label(b, box_idx), side))
+                if not contacts:
+                    warnings.append({
+                        "flow": flow_name,
+                        "endpoint": endpoint_name,
+                        "issue": "arrow_endpoint_not_on_box_border",
+                        "point": [round(point[0], 3), round(point[1], 3)],
+                        "guidance": "Move the arrow endpoint onto the target/source box edge or an explicit port dot.",
+                    })
+                else:
+                    _, side = contacts[0]
+                    perpendicular = (
+                        (side in ("left", "right") and orientation == "horizontal")
+                        or (side in ("top", "bottom") and orientation == "vertical")
+                    )
+                    if not perpendicular:
+                        warnings.append({
+                            "flow": flow_name,
+                            "endpoint": endpoint_name,
+                            "issue": "arrow_not_perpendicular_to_box_edge",
+                            "side": side,
+                            "orientation": orientation,
+                            "guidance": "Route the last/first segment perpendicular into the box edge; do not run parallel along it.",
+                        })
         for seg_idx in range(len(points) - 1):
             terminal_segment = seg_idx == 0 or seg_idx == len(points) - 2
             x1, y1 = map(float, points[seg_idx])
@@ -299,10 +429,14 @@ def lint_spec(spec: Dict[str, Any], clearance: float = 0.18) -> Dict[str, Any]:
                         issue = "diagonal_near_box"
                 if issue:
                     # Terminal connector segments normally enter/exit their
-                    # source/target boxes. Clearance lint focuses on the
-                    # intermediate route corridors that should remain visibly
-                    # separated from modules.
-                    if terminal_segment:
+                    # source/target boxes. They are exempt only for the box
+                    # they actually touch; terminal segments crossing any
+                    # other component are still invalid.
+                    touches_terminal_box = (
+                        _endpoint_contact((x1, y1), b, clearance) is not None
+                        or _endpoint_contact((x2, y2), b, clearance) is not None
+                    )
+                    if terminal_segment and touches_terminal_box:
                         continue
                     warnings.append({
                         "flow": flow.get("id") or f"flow#{flow_idx}",
@@ -344,10 +478,10 @@ def example_spec() -> Dict[str, Any]:
         ],
         "flows": [
             {"kind": "data", "points": [[1.55, 3.24], [1.88, 3.24], [1.88, 2.01], [2.25, 2.01]], "label": {"x": 1.18, "y": 2.36, "w": 1.05, "h": 0.24, "text": "request"}},
-            {"kind": "data", "points": [[2.25, 2.15], [1.88, 2.15], [1.88, 3.58], [8.62, 3.58], [8.62, 5.25]], "label": {"x": 4.15, "y": 3.31, "w": 2.75, "h": 0.25, "text": "data path to workload"}},
-            {"kind": "control", "points": [[3.40, 1.92], [5.82, 1.92]], "label": {"x": 4.20, "y": 1.55, "w": 1.20, "h": 0.22, "text": "resolve/create"}},
+            {"kind": "data", "points": [[2.25, 2.15], [1.88, 2.15], [1.88, 3.58], [8.62, 3.58], [8.62, 5.16]], "label": {"x": 4.15, "y": 3.31, "w": 2.75, "h": 0.25, "text": "data path to workload"}},
+            {"kind": "control", "points": [[4.80, 1.92], [5.82, 1.92]], "label": {"x": 4.20, "y": 1.55, "w": 1.20, "h": 0.22, "text": "resolve/create"}},
             {"kind": "control", "points": [[7.07, 1.98], [8.88, 1.98]], "begin_arrow": True, "label": {"x": 7.70, "y": 1.38, "w": 1.35, "h": 0.22, "text": "state"}},
-            {"kind": "runtime", "points": [[7.00, 4.84], [7.70, 5.25]], "label": {"x": 6.90, "y": 4.33, "w": 1.35, "h": 0.22, "text": "runtime call"}},
+            {"kind": "runtime", "points": [[7.00, 4.84], [7.70, 4.84], [7.70, 5.16]], "label": {"x": 6.90, "y": 4.33, "w": 1.35, "h": 0.22, "text": "runtime call"}},
         ],
     }
 

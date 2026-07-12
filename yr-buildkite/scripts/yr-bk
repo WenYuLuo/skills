@@ -5,7 +5,13 @@ CONFIG_DIR="${YR_BK_CONFIG_DIR:-$HOME/.config/yr-buildkite}"
 CONFIG_FILE="${YR_BK_CONFIG:-$CONFIG_DIR/config.env}"
 STATE_DIR="$CONFIG_DIR/state"
 LATEST_FILE="$STATE_DIR/latest.json"
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
+  SOURCE=$(readlink "$SOURCE")
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
 SKILL_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 LOCAL_CONFIG_FILE="${YR_BK_LOCAL_CONFIG:-$SKILL_DIR/config/config.env.local}"
 
@@ -62,10 +68,10 @@ expand_path() { local p="${1:-}"; [[ "$p" == ~* ]] && printf '%s\n' "${p/#\~/$HO
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1" >&2; return 1; }; }
 api_base() { printf 'https://api.buildkite.com/v2/organizations/%s/pipelines/%s' "$YR_BK_ORG" "$YR_BK_PIPELINE"; }
 require_token() { [[ -n "${BUILDKITE_API_TOKEN:-}" ]] || { echo "Buildkite token is required. Run: yr-bk init" >&2; exit 2; }; }
-api_get() { require_token; curl -sS -H "Authorization: Bearer $BUILDKITE_API_TOKEN" "$1"; }
-api_post() { require_token; curl -sS -H "Authorization: Bearer $BUILDKITE_API_TOKEN" -H 'Content-Type: application/json' -X POST "$1" -d "$2"; }
-api_patch() { require_token; curl -sS -H "Authorization: Bearer $BUILDKITE_API_TOKEN" -H 'Content-Type: application/json' -X PATCH "$1" -d "$2"; }
-api_put() { require_token; curl -sS -H "Authorization: Bearer $BUILDKITE_API_TOKEN" -X PUT "$1"; }
+api_get() { require_token; curl --http1.1 -sS -H "Authorization: Bearer $BUILDKITE_API_TOKEN" "$1"; }
+api_post() { require_token; curl --http1.1 -sS -H "Authorization: Bearer $BUILDKITE_API_TOKEN" -H 'Content-Type: application/json' -X POST "$1" -d "$2"; }
+api_patch() { require_token; curl --http1.1 -sS -H "Authorization: Bearer $BUILDKITE_API_TOKEN" -H 'Content-Type: application/json' -X PATCH "$1" -d "$2"; }
+api_put() { require_token; curl --http1.1 -sS -H "Authorization: Bearer $BUILDKITE_API_TOKEN" -X PUT "$1"; }
 
 usage() {
   cat <<'USAGE'
@@ -532,8 +538,17 @@ cmd_vpn() {
   local sub="${1:-check}"
   case "$sub" in
     check)
-      ip -brief addr show "$YR_BK_VPN_INTERFACE" 2>/dev/null || echo "VPN interface missing: $YR_BK_VPN_INTERFACE"
-      ip route | grep -E "${YR_BK_VPN_ALLOWED_IPS//,/|}" || true
+      if command -v ip >/dev/null 2>&1; then
+        ip -brief addr show "$YR_BK_VPN_INTERFACE" 2>/dev/null || echo "VPN interface missing: $YR_BK_VPN_INTERFACE"
+        ip route | grep -E "${YR_BK_VPN_ALLOWED_IPS//,/|}" || true
+      else
+        if command -v wg >/dev/null 2>&1 && wg show interfaces | grep -q .; then
+          echo "WireGuard interfaces: $(wg show interfaces)"
+        else
+          ifconfig "$YR_BK_VPN_INTERFACE" 2>/dev/null || echo "VPN interface missing: $YR_BK_VPN_INTERFACE"
+        fi
+        netstat -rn | grep -E '10\.99\.|10\.10\.' || true
+      fi
       for h in ${YR_BK_VPN_CHECK_HOSTS//,/ }; do ping -c 1 -W 2 "$h" >/dev/null && echo "ping $h OK" || echo "ping $h FAILED"; done
       ;;
     install-plan)

@@ -95,7 +95,7 @@ GitHub 只保留 `config/config.yaml.template`，不要提交真实 token。
 
 ```yaml
 api:
-  base_url: "https://api.gitcode.com/api/v5"
+  base_url: "https://gitcode.com/api/v5"
   access_token: "${YUANRONG_PAT}"
 
 defaults:

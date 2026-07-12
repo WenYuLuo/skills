@@ -31,7 +31,7 @@ write_config() {
   umask 077
   cat > "$dest" <<CFG
 api:
-  base_url: "https://api.gitcode.com/api/v5"
+  base_url: "https://gitcode.com/api/v5"
   access_token: "$token"
 
 defaults:

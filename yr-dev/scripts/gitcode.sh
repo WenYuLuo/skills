@@ -16,7 +16,9 @@ Commands:
   show <repo> <iid>                                      Show MR details
   diff <repo> <iid>                                      Show MR file changes
   commits <repo> <iid>                                   Show MR commits
-  create-pr <repo> <branch> <title> [body]               Create MR (branch must be pushed)
+  create-pr <repo> <branch> <title> [body] [--base BRANCH] [--head OWNER:BRANCH] [--assignees USERS]
+                                                         Create MR (branch must be pushed)
+  check-pr <repo> <iid> [--base REF]                     Validate commits/title/body and comment /check-pr
   issues <repo> [--state open|closed|all] [--limit N]    List issues
   issue <repo> <number>                                  Show issue
   create-issue <repo> <title> [body]                     Create issue
@@ -70,9 +72,50 @@ cmd_create_pr() {
     local branch="$2"
     local title="$3"
     local body="${4:-}"
-    local json=$(jq -n --arg t "$title" --arg h "$branch" --arg b "$body" \
-        '{title: $t, head: $h, base: "master", body: $b}')
-    gitcode_post "repos/$repo/pulls" "$json" | jq '{iid: .iid, title: .title, url: .web_url}'
+    shift 4
+    local base="master" head_override="" assignees=""
+    validate_yr_subject "$title" "MR title"
+    validate_yr_mr_body "$repo" "$title" "$body"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --base) base="$2"; shift 2 ;;
+            --head) head_override="$2"; shift 2 ;;
+            --assignees) assignees="$2"; shift 2 ;;
+            *) echo "ERROR: unknown option $1" >&2; exit 1 ;;
+        esac
+    done
+    local base_ref="upstream/$base"
+    git rev-parse --verify "$base_ref" >/dev/null 2>&1 || base_ref="origin/$base"
+    git rev-parse --verify "$base_ref" >/dev/null 2>&1 || base_ref="$base"
+    validate_yr_commit_range "$base_ref"
+    local head="$branch"
+    if [[ -n "$head_override" ]]; then
+        head="$head_override"
+    else
+        local origin_repo
+        origin_repo=$(current_origin_repo_path || true)
+        if [[ -n "$origin_repo" && "$origin_repo" != "$repo" ]]; then
+            head="${origin_repo%%/*}:$branch"
+        fi
+    fi
+    local json
+    json=$(jq -n --arg t "$title" --arg h "$head" --arg base "$base" --arg b "$body" \
+        '{title: $t, head: $h, base: $base, body: $b}')
+    if [[ -n "$assignees" ]]; then
+        json=$(printf '%s\n' "$json" | jq --arg assignees "$assignees" '. + {assignees: $assignees}')
+    fi
+    local response iid
+    response=$(gitcode_post "repos/$repo/pulls" "$json")
+    iid=$(printf '%s\n' "$response" | jq -r '.iid // .number // empty')
+    if [[ -n "$iid" ]]; then
+        gitcode_post "repos/$repo/pulls/$iid/comments" '{"body":"/check-pr"}' >/dev/null
+    fi
+    printf '%s\n' "$response" | jq '{iid: (.iid // .number), title: .title, url: (.web_url // .html_url)}'
+}
+
+cmd_check_pr() {
+    local repo="$1" iid="$2"; shift 2
+    "$SCRIPT_DIR/preflight-pr.sh" "$repo" --iid "$iid" --comment-check-pr "$@"
 }
 
 cmd_issues() {
@@ -114,12 +157,14 @@ cmd_comment_issue() {
 
 [ $# -lt 1 ] && usage
 
-case "${1,,}" in
+cmd=$(yr_lower "$1")
+case "$cmd" in
     list)    shift; cmd_list "$@" ;;
     show)    shift; cmd_show "$@" ;;
     diff)    shift; cmd_diff "$@" ;;
     commits) shift; cmd_commits "$@" ;;
     create-pr) shift; cmd_create_pr "$@" ;;
+    check-pr) shift; cmd_check_pr "$@" ;;
     issues)  shift; cmd_issues "$@" ;;
     issue)   shift; cmd_issue "$@" ;;
     create-issue) shift; cmd_create_issue "$@" ;;

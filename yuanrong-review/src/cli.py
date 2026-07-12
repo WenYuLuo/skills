@@ -16,18 +16,18 @@ if __package__ in (None, ""):
     from gitcode_api import GitCodeAPI
     from repo_manager import RepoManager, Repository, get_repo_manager
     from review_engine import ReviewEngine, create_pr_summary
-    from comment_formatter import Severity, ReviewComment
+    from comment_formatter import CommentFormatter, Severity, ReviewComment
 else:
     from .gitcode_api import GitCodeAPI
     from .repo_manager import RepoManager, Repository, get_repo_manager
     from .review_engine import ReviewEngine, create_pr_summary
-    from .comment_formatter import Severity, ReviewComment
+    from .comment_formatter import CommentFormatter, Severity, ReviewComment
 
 
 # 默认配置
 DEFAULT_CONFIG = {
     "api": {
-        "base_url": "https://api.gitcode.com/api/v5",
+        "base_url": "https://gitcode.com/api/v5",
         "access_token": "${YUANRONG_PAT}",
     },
     "defaults": {
@@ -258,7 +258,16 @@ def cmd_review(args: argparse.Namespace) -> int:
             return 0
 
         # 打印摘要
-        summary = create_pr_summary(comments)
+        critical = sum(1 for c in comments if c.severity == Severity.CRITICAL)
+        warnings = sum(1 for c in comments if c.severity == Severity.WARNING)
+        suggestions = sum(1 for c in comments if c.severity == Severity.SUGGESTION)
+        summary = create_pr_summary(
+            total_files=len(engine.api.get_pull_files(repo.owner, repo.repo, pr_number)),
+            total_comments=len(comments),
+            critical=critical,
+            warnings=warnings,
+            suggestions=suggestions,
+        )
         print(summary)
 
         # 如果不是试运行，提交评论

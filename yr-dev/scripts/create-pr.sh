@@ -4,7 +4,9 @@
 # 用法:
 #   create-pr.sh yuanrong "fix(docs): 修复xxx" "详细说明"  # 自动分支名
 #   create-pr.sh yuanrong "fix(docs): 修复xxx" "详细说明" my-branch  # 指定分支名
-#   create-pr.sh yuanrong "fix(docs): 修复xxx" "" my-branch master
+#   create-pr.sh yuanrong "fix(docs): 修复xxx" "" my-branch feature/sandbox
+#   create-pr.sh yuanrong "fix(docs): 修复xxx" "详细说明" "" feature/sandbox --assignees luozhancheng
+#   create-pr.sh yuanrong "fix(docs): 修复xxx" "详细说明" "" feature/sandbox --head luozhancheng:fix/docs-xxx
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -22,12 +24,38 @@ TITLE="${2:-}"
 BODY="${3:-}"
 BRANCH_NAME="${4:-}"
 BASE_BRANCH="${5:-master}"
+ASSIGNEES=""
+HEAD_OVERRIDE=""
 
 if [ -z "$TITLE" ]; then
     echo "Usage: create-pr.sh <repo> <title> [body] [branch-name] [base-branch]" >&2
     echo "  repo: yuanrong|ds|fs|fe 或完整路径" >&2
     exit 1
 fi
+
+validate_yr_subject "$TITLE" "MR title"
+
+shift $(( $# > 5 ? 5 : $# ))
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --assignees)
+            ASSIGNEES="${2:-}"
+            shift 2
+            ;;
+        --head)
+            HEAD_OVERRIDE="${2:-}"
+            shift 2
+            ;;
+        --base)
+            BASE_BRANCH="${2:-}"
+            shift 2
+            ;;
+        *)
+            echo "ERROR: 未知参数: $1" >&2
+            exit 1
+            ;;
+    esac
+done
 
 # 自动生成分支名
 if [ -z "$BRANCH_NAME" ]; then
@@ -61,6 +89,8 @@ if [ -n "$BODY" ]; then
     FULL_MSG="$FULL_MSG"$'\n\n'"$BODY"
 fi
 FULL_MSG="$FULL_MSG"$'\n\n'"$SIGNOFF"
+validate_yr_commit_message "$FULL_MSG" "new commit"
+validate_yr_mr_body "$REPO" "$TITLE" "$BODY"
 
 git add -A
 git commit -m "$FULL_MSG" || {
@@ -78,11 +108,29 @@ git push -u origin "$BRANCH_NAME" || {
 
 # 创建 MR
 echo ">>> 创建 MR ..."
-MR_URL=$(curl -sf -X POST "$GITCODE_API_BASE/repos/$REPO/pulls" \
-    -H "Content-Type: application/json" \
-    -H "private-token: $GITCODE_TOKEN" \
-    -d "$(jq -n --arg t "$TITLE" --arg h "$BRANCH_NAME" --arg b "$BASE_BRANCH" \
-        --arg body "$BODY" '{title: $t, head: $h, base: $b, body: $body}')" \
-    | jq -r '.web_url // "创建失败"')
+HEAD_REF="$BRANCH_NAME"
+if [ -n "$HEAD_OVERRIDE" ]; then
+    HEAD_REF="$HEAD_OVERRIDE"
+else
+    ORIGIN_REPO=$(current_origin_repo_path || true)
+    if [ -n "$ORIGIN_REPO" ] && [ "$ORIGIN_REPO" != "$REPO" ]; then
+        HEAD_REF="${ORIGIN_REPO%%/*}:$BRANCH_NAME"
+    fi
+fi
+
+PAYLOAD=$(jq -n --arg t "$TITLE" --arg h "$HEAD_REF" --arg b "$BASE_BRANCH" --arg body "$BODY" \
+    '{title: $t, head: $h, base: $b, body: $body}')
+if [ -n "$ASSIGNEES" ]; then
+    PAYLOAD=$(printf '%s\n' "$PAYLOAD" | jq --arg assignees "$ASSIGNEES" '. + {assignees: $assignees}')
+fi
+
+MR_RESPONSE=$(gitcode_post "repos/$REPO/pulls" "$PAYLOAD")
+MR_URL=$(printf '%s\n' "$MR_RESPONSE" | jq -r '.web_url // .html_url // "创建失败"')
+MR_IID=$(printf '%s\n' "$MR_RESPONSE" | jq -r '.iid // .number // empty')
+
+if [ -n "$MR_IID" ]; then
+    gitcode_post "repos/$REPO/pulls/$MR_IID/comments" '{"body":"/check-pr"}' >/dev/null
+    echo ">>> 已评论 /check-pr"
+fi
 
 echo ">>> MR 已创建: $MR_URL"

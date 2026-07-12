@@ -47,14 +47,44 @@ class PRComment:
 class GitCodeAPI:
     """GitCode API 客户端"""
 
-    def __init__(self, access_token: str, base_url: str = "https://api.gitcode.com/api/v5"):
+    def __init__(self, access_token: str, base_url: str = "https://gitcode.com/api/v5"):
         self.token = access_token
         self.base_url = base_url.rstrip('/')
         self.headers = {
-            "Authorization": f"token {access_token}",
+            "private-token": access_token,
             "Accept": "application/json",
             "Content-Type": "application/json"
         }
+
+    @staticmethod
+    def _pr_number(data: Dict) -> int:
+        return data.get("number") or data.get("iid")
+
+    @staticmethod
+    def _pr_user(data: Dict) -> str:
+        user = data.get("user") or data.get("author") or {}
+        head = data.get("head") or {}
+        head_user = head.get("user") or {}
+        return user.get("login") or head_user.get("login") or ""
+
+    @staticmethod
+    def _pr_url(data: Dict) -> str:
+        return data.get("html_url") or data.get("web_url") or data.get("url") or ""
+
+    @staticmethod
+    def _pr_created_at(data: Dict) -> str:
+        return data.get("created_at") or data.get("created") or ""
+
+    @staticmethod
+    def _pr_updated_at(data: Dict) -> str:
+        return data.get("updated_at") or data.get("updated") or ""
+
+    @staticmethod
+    def _file_patch(data: Dict) -> Optional[str]:
+        patch = data.get("patch")
+        if isinstance(patch, dict):
+            return patch.get("diff")
+        return patch
 
     def _get(self, endpoint: str, params: Optional[Dict] = None) -> Any:
         """发送 GET 请求"""
@@ -79,13 +109,13 @@ class GitCodeAPI:
 
         return [
             PullRequest(
-                number=pr["number"],
+                number=self._pr_number(pr),
                 title=pr["title"],
                 state=pr["state"],
-                user=pr["user"]["login"],
-                created_at=pr["created_at"],
-                updated_at=pr["updated_at"],
-                html_url=pr["html_url"],
+                user=self._pr_user(pr),
+                created_at=self._pr_created_at(pr),
+                updated_at=self._pr_updated_at(pr),
+                html_url=self._pr_url(pr),
                 body=pr.get("body")
             )
             for pr in data
@@ -97,13 +127,13 @@ class GitCodeAPI:
         data = self._get(endpoint)
 
         return PullRequest(
-            number=data["number"],
+            number=self._pr_number(data),
             title=data["title"],
             state=data["state"],
-            user=data["user"]["login"],
-            created_at=data["created_at"],
-            updated_at=data["updated_at"],
-            html_url=data["html_url"],
+            user=self._pr_user(data),
+            created_at=self._pr_created_at(data),
+            updated_at=self._pr_updated_at(data),
+            html_url=self._pr_url(data),
             body=data.get("body")
         )
 
@@ -115,10 +145,10 @@ class GitCodeAPI:
         return [
             PRFile(
                 filename=f["filename"],
-                status=f["status"],
+                status=f.get("status") or "modified",
                 additions=f["additions"],
                 deletions=f["deletions"],
-                patch=f.get("patch"),
+                patch=self._file_patch(f),
                 previous_filename=f.get("previous_filename")
             )
             for f in data
@@ -132,9 +162,9 @@ class GitCodeAPI:
         return [
             PRComment(
                 id=c["id"],
-                user=c["user"]["login"],
+                user=(c.get("user") or c.get("author") or {}).get("login", ""),
                 body=c["body"],
-                created_at=c["created_at"],
+                created_at=c.get("created_at", ""),
                 path=c.get("path"),
                 position=c.get("position")
             )
@@ -156,9 +186,9 @@ class GitCodeAPI:
 
         return PRComment(
             id=response["id"],
-            user=response["user"]["login"],
+            user=(response.get("user") or response.get("author") or {}).get("login", ""),
             body=response["body"],
-            created_at=response["created_at"],
+            created_at=response.get("created_at", ""),
             path=response.get("path"),
             position=response.get("position")
         )

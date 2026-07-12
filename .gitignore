@@ -4,6 +4,8 @@
 **/config/config.yaml
 **/config/wg0.conf
 **/config/kubekind.yaml
+**/config/imported/
+**/config/runtime/
 !**/config/*.example
 !**/config/*.template
 
@@ -11,6 +13,10 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.venv/
+
+# Local tools and provider credentials (not public skills)
+ccs/
 
 # Buildkite/local artifacts
 buildkite-artifacts/

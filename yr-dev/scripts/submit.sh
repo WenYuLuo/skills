@@ -48,15 +48,7 @@ else
     MSG="$1"
 fi
 
-# 检查 commit message 格式
-if ! echo "$MSG" | grep -qE '^(fix|feat|docs|style|refactor|test|chore|perf|ci|build|revert)(\([^)]+\)|\[[^\]]+\])?:'; then
-    echo "ERROR: commit message 不符合规范" >&2
-    echo "  格式: type(scope): 描述" >&2
-    echo "  例如: fix(docs): 修复编译文档" >&2
-    echo "" >&2
-    echo "  你的: $MSG" >&2
-    exit 1
-fi
+validate_yr_subject "$(printf '%s\n' "$MSG" | head -n 1)" "commit subject"
 
 # 自动追加 Signed-off-by（如果还没有）
 FULL_MSG="$MSG"
@@ -66,6 +58,7 @@ if ! echo "$FULL_MSG" | grep -qF "Signed-off-by:"; then
 
 $SIGNOFF"
 fi
+validate_yr_commit_message "$FULL_MSG" "new commit"
 
 # 执行提交
 if [ "$1" = "--amend" ]; then

@@ -1,0 +1,4 @@
+interface:
+  display_name: "YuanRong Local 3VM"
+  short_description: "Operate a reusable local three-node YuanRong cluster"
+  default_prompt: "Use $yr-local-3vm to prepare, deploy, validate, or troubleshoot a local three-node openYuanRong development cluster."

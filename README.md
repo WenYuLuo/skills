@@ -5,6 +5,7 @@ Portable local skills for openYuanRong development, Buildkite CI, and GitCode PR
 ## Included Skills
 
 - `yr-dev` — openYuanRong repository map, GitCode helpers, commit/MR workflow, build order, install/deploy notes, and local asset hints.
+- `yr-local-3vm` — generic local three-node Lima/process-mode deployment, health, E2E, fault, and evidence workflow for any openYuanRong project.
 - `yr-buildkite` — Buildkite status/log/artifact tooling, Rust FunctionSystem E2E trigger, compile image workflow, SWR/image checks, C++ baseline, and A/B ST validation references.
 - `yuanrong-review` — GitCode PR list/show/review helper across openYuanRong repos.
 
@@ -29,11 +30,16 @@ Never commit real GitCode, Buildkite, SWR, kubeconfig, or WireGuard secrets. To 
 
 ## Install Shape
 
-For Codex, copy or symlink these three skill directories into `~/.codex/skills/`.
+The tracked repository is the single source of truth. Install every public skill into Codex with
+idempotent symlinks; do not maintain copied skill directories that can drift.
 
 ```bash
-mkdir -p ~/.codex/skills
-cp -a yr-dev yr-buildkite yuanrong-review ~/.codex/skills/
+./scripts/install-codex-skills.sh
+./scripts/install-codex-skills.sh --check
 ```
+
+The installer scans every direct child containing `SKILL.md`, keeps correct links, creates missing
+links, and refuses to overwrite a real directory or a link to another source. Codex discovers new
+links on the next task/session.
 
 `yr-buildkite/install.sh` also installs the `yr-bk` command into `~/.local/bin`.

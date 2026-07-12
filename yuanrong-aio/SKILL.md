@@ -111,6 +111,33 @@ are in the bin dir) is the reliable way to make a new binary effective.
 - **Two python paths:** the bin dir is reachable via both the `cpython-3.10` symlink
   and the `cpython-3.10.13` real dir; use the `3.10` symlink path (stable across patch).
 
+## Execution model — process vs container backend (IRON RULE)
+
+AIO = the remote cluster **minus the K8s layer**: one outer container holds N node
+containers (master + workers); inside each node container, runtimes run as **processes**,
+exactly like a real remote node. Remote = K8s pulls the same node containers, same
+process-mode runtimes inside. So within single-machine scale, **process-mode AIO faithfully
+simulates remote** — a failure in process-mode AIO is a real functionsystem gap; a pass is a
+real pass.
+
+The runtime backend is chosen **per function** by `services.yaml`:
+- A python function variant **with a `rootfs:` block** (e.g. `py310`/`py39` in the stock
+  image, `imageurl: aio-yr-runtime`) → **CONTAINER backend**: every instance is a *nested
+  docker container* (~2–4 s to launch). This exists only for the **sandbox/traefik routing**
+  tests. It is **far too slow for the functionsystem correctness/concurrency suites** —
+  `task_invoke` (1000 invokes), nested invoke, batch, etc. overflow the 60 s runtime
+  *connect-back* window and hang. These hangs are an **environment artifact, NOT a rust bug**
+  (the same cases pass in seconds on the process-mode remote).
+- A variant **without `rootfs:`** (e.g. `default`/`py311`) → **PROCESS backend**: the agent
+  forks the runtime process (ms-level), same as remote.
+
+**Rule:** the test driver's python version selects the function variant (driver py3.10 →
+`py310`). To run the **functionsystem actor/invoke suites**, deploy with a **process-mode
+`services.yaml`** — strip the `rootfs:`+`bootstrap:` blocks from the variant the driver maps
+to (so `py310` becomes process mode like `default`). Then build the AIO image on top and run.
+Only use the container backend for the sandbox-routing case. Never diagnose container-backend
+"connect-back timed out / hang" as a rust bug — switch to process mode and re-judge.
+
 ## What each case proves
 
 - `smoke` (`cases/sdk_smoke.py`): SDK init, stateless `@yr.invoke`, stateful

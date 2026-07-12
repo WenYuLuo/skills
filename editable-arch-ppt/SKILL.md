@@ -69,6 +69,8 @@ Routing rules:
 
 - Reserve empty corridors for lines before placing boxes.
 - Reserve **gutter space** around every meaningful module: keep routed lines at least `0.18in` away from component borders except at the final source/target contact point.
+- Final arrow segments must enter the target box **perpendicular** to the contacted edge: horizontal into left/right edges, vertical into top/bottom edges. Do not use a line that lies parallel to, or flat along, a box edge and then pretend it targets that box.
+- Arrowheads must visibly touch the target box border or an explicit small port/pin dot placed just outside the border. Floating arrowheads that stop short of a box are invalid.
 - Data flow usually goes outer/bottom corridor, not through control-plane modules.
 - Control flow can use upper/middle corridors.
 - Runtime calls should be short local arrows inside a node/pod.
@@ -81,6 +83,7 @@ Routing rules:
 - Do not route a connector through the center of a component box or over its text. Use edge ports: connect to the nearest border or to a small dot just outside the border.
 - For hub-and-spoke diagrams, place the hub outside the text area or use perimeter ports; avoid drawing spokes into the center of labeled boxes.
 - Labels sit near the path but should not cover module names.
+- If a connector would need to pass through a box, split the slide, move the box, add a side bus, or remove the arrow. Never accept a line crossing text as a tradeoff.
 
 Recommended clearance defaults:
 
@@ -104,6 +107,14 @@ body notes: 8.5-10pt
 ```
 
 Do not shrink fonts to fit everything. If text needs to go below these sizes, split the slide or move explanation into a note box.
+
+Text-fit rules:
+
+- Component boxes contain short names only. Do not put multi-line explanations, field lists, or sentence fragments inside component boxes.
+- A component label must have stable visual proportion: normally 8.5-11pt, centered, with at least `0.08in` horizontal text margin and `0.05in` vertical margin.
+- Body notes and field lists need enough height for their line count. If a note touches or exits its box, enlarge the note, shorten the copy, or split the slide. Do not rely on PowerPoint auto-fit making text tiny.
+- Footer/source notes must live in their own reserved band and must not overlap the main content panel.
+- Before rendering, estimate text fit from longest lines and line count; after rendering, visually inspect dense text slides at 100% zoom.
 
 Readable layout defaults:
 
@@ -170,12 +181,15 @@ Minimum pass bar:
 - `bentConnector > 0` when there are flows
 - `arrowheads > 0` when there are directed flows
 - `plain_line == 0` for main flow connectors; if nonzero, explain why or regenerate
-- spec lint should report no connector segments crossing module rectangles and no non-terminal line corridors within the clearance gutter. If there are warnings, either reroute, simplify arrows, or explicitly note the remaining manual polish risk.
+- spec lint should report no connector segments crossing module rectangles, no non-terminal line corridors within the clearance gutter, no text overflow risks, no floating arrow endpoints, and no arrow endpoint entering a box from a parallel segment. If there are warnings, reroute, resize, shorten copy, split slides, or simplify arrows before reporting completion.
 
 Also inspect logically:
 
 - No orphan/hanging flow lines.
 - No connector body visually hugs the border of a box. Endpoint contact is OK; a long horizontal/vertical segment lying on a box edge is not OK.
+- Arrowheads visibly terminate on the intended box border or explicit port dot, and the final segment is perpendicular to that border.
+- No connector crosses a component box or text area, even if the line is behind the text.
+- No text leaves its textbox or appears tiny relative to peer labels. Component labels, note bodies, and footers must look intentionally sized.
 - Data/control/runtime/config flows are not conflated.
 - Config/CRD boxes are not in the business request path unless true.
 - Major arrows have labels and readable direction.
