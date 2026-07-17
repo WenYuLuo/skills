@@ -38,6 +38,18 @@ idempotent symlinks; do not maintain copied skill directories that can drift.
 ./scripts/install-codex-skills.sh --check
 ```
 
+To preserve existing skills with the same names, install the repository as one routed toolkit
+instead. This creates only `~/.codex/skills/yuanrong-toolkit` and leaves every existing skill
+untouched:
+
+```bash
+./scripts/install-codex-skills.sh --toolkit
+./scripts/install-codex-skills.sh --toolkit --check
+```
+
+The toolkit link points at this repository root. Its top-level `SKILL.md` routes tasks to the
+specialized child skills, so pulling repository updates makes them available without reinstalling.
+
 The installer scans every direct child containing `SKILL.md`, keeps correct links, creates missing
 links, and refuses to overwrite a real directory or a link to another source. Codex discovers new
 links on the next task/session.
