@@ -1,0 +1,4 @@
+interface:
+  display_name: "YR Jenkins"
+  short_description: "Monitor YuanRong Jenkins builds and inspect console logs safely."
+  default_prompt: "Use this skill to query YuanRong Jenkins build status, fetch consoleText, follow downstream jobs, and extract the first actionable failure."
