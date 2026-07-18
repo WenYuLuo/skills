@@ -4,7 +4,7 @@
 # restart-to-apply). Works for both AI and humans.
 #
 # Usage:
-#   yr-aio.sh up    <cpp|rust> [name] [host_port]   # launch a fresh AIO container
+#   yr-aio.sh up    <cpp|rust|image> [name] [host_port] # launch a fresh AIO container
 #   yr-aio.sh wait  <name>                          # block until the cluster is READY
 #   yr-aio.sh smoke <name>                          # run the canonical SDK smoke case
 #   yr-aio.sh case  <name> <host_script.py>         # run an arbitrary python case inside
@@ -19,18 +19,36 @@
 set -euo pipefail
 
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN_PATH="/opt/uv/python/cpython-3.10-linux-aarch64-gnu/lib/python3.10/site-packages/yr/inner/functionsystem/bin"
 
 image_for() {
   case "$1" in
-    cpp)  echo "yuanrong-aio:cpp" ;;
-    rust) echo "yuanrong-aio:rust" ;;
-    *) echo "unknown stack '$1' (use cpp|rust)" >&2; exit 2 ;;
+    cpp)  echo "${YR_AIO_CPP_IMAGE:-yuanrong-aio:cpp}" ;;
+    rust) echo "${YR_AIO_RUST_IMAGE:-yuanrong-aio:rust}" ;;
+    *)    echo "$1" ;;
   esac
 }
 
+bin_path_for() {
+  local name="${1:?name}"
+  docker exec "$name" python3 -c '
+from pathlib import Path
+import yr
+root = Path(yr.__file__).resolve().parent
+for rel in ("functionsystem/bin", "inner/functionsystem/bin"):
+    candidate = root / rel
+    if candidate.is_dir():
+        print(candidate)
+        raise SystemExit(0)
+raise SystemExit(f"functionsystem bin directory not found below {root}")
+'
+}
+
 cmd_up() {
-  local stack="${1:?stack cpp|rust}"; local name="${2:-yrv-$stack}"; local port="${3:-}"
+  local stack="${1:?stack cpp|rust, or an image tag}"
+  local default_name="yrv-local"
+  [ "$stack" = "cpp" ] && default_name="yrv-cpp"
+  [ "$stack" = "rust" ] && default_name="yrv-rust"
+  local name="${2:-$default_name}"; local port="${3:-}"
   local image; image="$(image_for "$stack")"
   if ! docker image inspect "$image" >/dev/null 2>&1; then
     echo "image $image not found. Build/load it first (see SKILL.md)." >&2; exit 1
@@ -95,10 +113,12 @@ cmd_sandbox() {
 
 cmd_swap() {
   local name="${1:?name}"; local bin="${2:?bin e.g. function_proxy}"; local file="${3:?host binary file}"
+  local bin_path
   [ -f "$file" ] || { echo "no such file: $file" >&2; exit 1; }
-  docker cp "$file" "$name:$BIN_PATH/$bin"
-  docker exec "$name" bash -lc "chmod +x $BIN_PATH/$bin"
-  echo "copied $file → $name:$BIN_PATH/$bin"
+  bin_path="$(bin_path_for "$name")"
+  docker cp "$file" "$name:$bin_path/$bin"
+  docker exec "$name" chmod +x "$bin_path/$bin"
+  echo "copied $file → $name:$bin_path/$bin"
   cmd_restart "$name"
 }
 

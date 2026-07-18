@@ -35,9 +35,11 @@ HEAD_SHA=$(echo "$MR_DATA" | jq -r '.head.sha')
 BASE_SHA=$(echo "$MR_DATA" | jq -r '.base.sha')
 TITLE=$(echo "$MR_DATA" | jq -r '.title')
 SOURCE_BRANCH=$(echo "$MR_DATA" | jq -r '.head.ref')
+SOURCE_REPO=$(echo "$MR_DATA" | jq -r '.head.repo.full_name // empty')
+[ -n "$SOURCE_REPO" ] || SOURCE_REPO="$REPO"
 
 echo "  MR:    !${IID} ${TITLE}"
-echo "  分支:  ${SOURCE_BRANCH} (${HEAD_SHA[0:8]}) -> $(echo "$MR_DATA" | jq -r '.base.ref')"
+echo "  分支:  ${SOURCE_BRANCH} (${HEAD_SHA:0:8}) -> $(echo "$MR_DATA" | jq -r '.base.ref')"
 echo ""
 
 # 列出变更文件
@@ -71,14 +73,29 @@ fi
 
 # 通过远程 fetch + cherry-pick 应用变更
 # 先 fetch 源分支的 commit
-REMOTE_URL=$(git remote get-url origin 2>/dev/null | sed 's|.*gitcode.com/||' | sed 's|\.git||')
 SOURCE_REMOTE="mr-${IID}-source"
+ASKPASS_FILE=$(mktemp)
+
+cat > "$ASKPASS_FILE" <<'ASKPASS'
+#!/usr/bin/env bash
+case "$1" in
+    *Username*) printf '%s\n' 'oauth2' ;;
+    *Password*) printf '%s\n' "$GITCODE_TOKEN" ;;
+    *) exit 1 ;;
+esac
+ASKPASS
+chmod 700 "$ASKPASS_FILE"
+
+cleanup_sync_remote() {
+    git remote remove "$SOURCE_REMOTE" 2>/dev/null || true
+    rm -f "$ASKPASS_FILE"
+}
 
 echo ">>> 添加临时 remote: $SOURCE_REMOTE"
 git remote remove "$SOURCE_REMOTE" 2>/dev/null || true
-trap 'git remote remove "$SOURCE_REMOTE" 2>/dev/null || true' EXIT
-git remote add "$SOURCE_REMOTE" "https://oauth2:${GITCODE_TOKEN}@gitcode.com/${REPO}.git"
-git fetch "$SOURCE_REMOTE" "$SOURCE_BRANCH" --quiet
+trap cleanup_sync_remote EXIT
+git remote add "$SOURCE_REMOTE" "https://gitcode.com/${SOURCE_REPO}.git"
+GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$ASKPASS_FILE" git fetch "$SOURCE_REMOTE" "$SOURCE_BRANCH" --quiet
 
 # cherry-pick 每个 commit（按顺序）
 echo ">>> Cherry-pick commits ..."
@@ -99,6 +116,7 @@ done
 # 清理临时 remote
 echo ">>> 清理临时 remote"
 git remote remove "$SOURCE_REMOTE" 2>/dev/null || true
+rm -f "$ASKPASS_FILE"
 trap - EXIT
 
 echo ""

@@ -5,7 +5,7 @@
 #
 #   yr-smoke-aio.sh build-image <bins-dir> [base-image] [tag] # bake bins+config into a smoke image
 #   yr-smoke-aio.sh up          [tag] [nodes]                # deploy master + (nodes-1) workers
-#   yr-smoke-aio.sh fetch-cases <gitcode-token> [dest]       # clone/update the smoke case repo
+#   yr-smoke-aio.sh fetch-cases [dest]                       # clone/update via configured credentials
 #   yr-smoke-aio.sh prepare     <cases-dir>                  # load cases + deps + config.ini into master
 #   yr-smoke-aio.sh run         [pytest-filter]              # isolated smoke run + pass/fail summary
 #   yr-smoke-aio.sh status | down
@@ -13,17 +13,15 @@
 # COMPILATION IS NOT THIS SKILL'S JOB — build the 4 binaries (function_master/proxy/agent +
 # domain_scheduler) via the **yr-dev** skill (network-stable Cargo build in the compile image,
 # .yr-cache, dynamic env), then point `build-image` at <rust-src>/target/release.
-# Env consistency: the compile image MUST match the AIO base (same arch + glibc; verified:
-# arm64 / Ubuntu 22.04.5 / glibc 2.35 / cpython-3.10) so the binaries run unchanged in the AIO.
+# Env consistency: the compile image MUST match the AIO base architecture and runtime ABI.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TPL="$(cd "$HERE/../templates" && pwd)"
-BIN_PATH='/opt/uv/python/cpython-3.10-linux-aarch64-gnu/lib/python3.10/site-packages/yr/inner/functionsystem/bin'
-MASTER=yr-smoke-master
-WPREFIX=yr-smoke-w
-DEFAULT_TAG=yr-smoke-aio:local
-DEFAULT_BASE=yuanrong-aio:rust
+MASTER="${YR_SMOKE_MASTER_NAME:-yr-smoke-master}"
+WPREFIX="${YR_SMOKE_WORKER_PREFIX:-yr-smoke-w}"
+DEFAULT_TAG="${YR_SMOKE_AIO_TAG:-yr-smoke-aio:local}"
+DEFAULT_BASE="${YR_SMOKE_AIO_BASE:-yuanrong-aio:rust}"
 MASTER_INFO_FILE=/tmp/yr_sessions/latest/master.info
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
@@ -67,15 +65,15 @@ cmd_up(){
   local minfo; minfo=$(docker exec "$MASTER" bash -lc "cat $MASTER_INFO_FILE" 2>/dev/null)
   [ -n "$minfo" ] || die "could not read master.info from $MASTER"
   echo "[up] master ip=$mip  workers=$((nodes-1))"
-  local nums=(odd even odd even odd)
   for i in $(seq 2 "$nodes"); do
-    local w="${WPREFIX}$((i-1))"; local wf; wf="$(mktemp)"
+    local number="odd"; local w="${WPREFIX}$((i-1))"; local wf; wf="$(mktemp)"
+    [ $((i % 2)) -eq 0 ] && number="even"
     # IMPORTANT: docker cp preserves source file mode -> chmod +x the HOST file so the
     # copied /usr/local/bin/start-yuanrong.sh is executable (else supervisord: "command
     # not executable" -> yuanrong-master FATAL -> worker never joins). Do NOT rely on
     # `docker exec chmod` between `create` and `start` (container isn't running yet).
     sed -e "s|__MASTER_INFO__|$minfo|" -e "s|__NODE_TAG__|node_tag${i}|" \
-        -e "s|__NODE_NAME__|node${i}|" -e "s|__NUMBER__|${nums[$((i-1))]}|" \
+        -e "s|__NODE_NAME__|node${i}|" -e "s|__NUMBER__|${number}|" \
         "$TPL/start-worker.sh" > "$wf"; chmod +x "$wf"
     docker create --name "$w" --privileged --cgroupns host "$tag" >/dev/null
     docker cp "$wf" "$w:/usr/local/bin/start-yuanrong.sh"; rm -f "$wf"
@@ -85,13 +83,21 @@ cmd_up(){
   cmd_status
 }
 
-# --- pull/refresh the smoke case repo (needs a GitCode token) ---
+# --- pull/refresh through the user's configured SSH/credential helper ---
 cmd_fetch_cases(){
-  local token="${1:?gitcode token}"; local dest="${2:-$HOME/yr-smoke-cases}"
-  # Adjust REPO/SUBDIR to your case source. Cases live under FunctionSystemTest/cases/python-actor.
-  local repo="${YR_SMOKE_CASES_REPO:-https://oauth2:${token}@gitcode.com/<org>/OpenYuanRongTest.git}"
-  if [ -d "$dest/.git" ]; then echo "[fetch-cases] updating $dest"; git -C "$dest" pull --ff-only;
-  else echo "[fetch-cases] cloning -> $dest"; GIT_TERMINAL_PROMPT=0 git clone --depth 1 "$repo" "$dest"; fi
+  local dest="${1:-$HOME/yr-smoke-cases}"
+  local repo="${YR_SMOKE_CASES_REPO:-}"
+  if [ -d "$dest/.git" ]; then
+    local saved_repo
+    saved_repo=$(git -C "$dest" remote get-url origin 2>/dev/null || true)
+    case "$saved_repo" in *://*@*) die "stored origin URL contains credentials; sanitize it before updating" ;; esac
+    echo "[fetch-cases] updating $dest"; git -C "$dest" pull --ff-only
+  else
+    [ -n "$repo" ] || die "set YR_SMOKE_CASES_REPO to an SSH URL or credential-helper-backed HTTPS URL"
+    case "$repo" in *://*@*) die "YR_SMOKE_CASES_REPO must not embed credentials" ;; esac
+    echo "[fetch-cases] cloning -> $dest"
+    GIT_TERMINAL_PROMPT=0 git clone --depth 1 "$repo" "$dest"
+  fi
   echo "[fetch-cases] python-actor cases:"; ls "$dest"/FunctionSystemTest/cases/python-actor/test_*.py 2>/dev/null | wc -l
 }
 
@@ -110,12 +116,16 @@ cmd_prepare(){
 # --- run smoke isolated (per-file process), with periodic health + leftover-runtime cleanup ---
 cmd_run(){
   local filter="${1:-}"; local res="${YR_SMOKE_RESULTS:-$HOME/yr-smoke-results.txt}"; : > "$res"
-  mapfile -t FILES < <(docker exec "$MASTER" bash -lc "cd /opt/yrtest/python-actor && ls test_*.py" | tr -d '\r' | { [ -n "$filter" ] && grep -E "$filter" || cat; })
+  local files=(); local f
+  while IFS= read -r f; do
+    [ -n "$f" ] && files+=("$f")
+  done < <(docker exec "$MASTER" bash -lc "cd /opt/yrtest/python-actor && ls test_*.py" | tr -d '\r' | { [ -n "$filter" ] && grep -E "$filter" || cat; })
+  [ "${#files[@]}" -gt 0 ] || die "no test files matched filter '$filter'"
   local i=0 nodes; nodes=$(docker ps --format '{{.Names}}' | grep -E "^$MASTER\$|^$WPREFIX" || true)
-  for f in "${FILES[@]}"; do i=$((i+1))
+  for f in "${files[@]}"; do i=$((i+1))
     local r; r=$(docker exec "$MASTER" bash -lc "cd /opt/yrtest/python-actor && YR_TEST_CONFIG_FILE=/root/.yr/config.ini timeout ${YR_SMOKE_TIMEOUT:-130} python3 -m pytest -q '$f' 2>&1 | grep -E 'passed|failed|error|no tests ran' | tail -1 | sed 's/\x1b\[[0-9;]*m//g'")
     [ -z "$r" ] && r="TIMEOUT_or_NOSUMMARY"
-    printf '%3d/%d  %-44s | %s\n' "$i" "${#FILES[@]}" "$f" "$r" | tee -a "$res"
+    printf '%3d/%d  %-44s | %s\n' "$i" "${#files[@]}" "$f" "$r" | tee -a "$res"
     if [ $((i % 10)) -eq 0 ]; then for n in $nodes; do
       local c; c=$(docker exec "$n" bash -lc 'docker ps -q 2>/dev/null | wc -l' 2>/dev/null)
       [ "${c:-0}" -gt 3 ] && docker exec "$n" bash -lc 'docker rm -f $(docker ps -q) >/dev/null 2>&1' 2>/dev/null || true
@@ -128,7 +138,10 @@ cmd_run(){
 
 cmd_status(){
   docker ps --format '{{.Names}}\t{{.Status}}' | grep -E "^$MASTER|^$WPREFIX" || echo "no yr-smoke containers"
-  docker exec "$MASTER" bash -lc 'curl -s -m5 http://172.17.0.4:8480/global-scheduler/resources 2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);print(\"node_count=\",d.get(\"node_count\"))" 2>/dev/null' 2>/dev/null || true
+  local mip
+  mip=$(docker exec "$MASTER" hostname -i 2>/dev/null | awk '{print $1}') || true
+  [ -n "$mip" ] || return 0
+  docker exec "$MASTER" bash -lc "curl -s -m5 http://${mip}:8480/global-scheduler/resources 2>/dev/null | python3 -c 'import sys,json;d=json.load(sys.stdin);print(\"node_count=\",d.get(\"node_count\"))' 2>/dev/null" 2>/dev/null || true
 }
 
 cmd_down(){ docker rm -f "$MASTER" >/dev/null 2>&1 || true; for i in $(seq 1 9); do docker rm -f "${WPREFIX}${i}" >/dev/null 2>&1 || true; done; echo "torn down"; }

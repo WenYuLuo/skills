@@ -17,7 +17,8 @@ read and follow that child's `SKILL.md`. Resolve all relative paths from the chi
 | Local reusable three-VM process-mode cluster | `yr-local-3vm/SKILL.md` |
 | Remote process-mode actor smoke tests | `yr-process-smoke/SKILL.md` |
 | Dedicated ECS cluster creation or smoke tests | `building-yr-smoke-ecs/SKILL.md` or `yr-dedicated-cluster-smoke/SKILL.md` |
-| Local multi-node or single-container AIO validation | `yr-smoke-aio/SKILL.md` or `yuanrong-aio/SKILL.md` |
+| Local single-container AIO SDK/FaaS/sandbox validation | `yuanrong-aio/SKILL.md` |
+| Local multi-node AIO actor smoke | `yr-smoke-aio/SKILL.md` |
 | Editable architecture PowerPoint diagrams | `editable-arch-ppt/SKILL.md` |
 | Remote access over Tailscale | `tailscale-remote/SKILL.md` |
 

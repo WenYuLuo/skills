@@ -105,23 +105,11 @@ Signed-off-by: Name <email>
 - **Signed-off-by**: 必填，格式 `<name> <email>`
 - hook 正则: `^(fix|feat|docs|...)(\([^)]+\)|\[[^\]]+\])?:.+[\s\S]*Signed-off-by:.+<.+@.+>`
 
-> ⚠️ **CLA 硬性规则（务必遵守，否则 CLA 检查必挂）**：commit message 里**只能有一行 `Signed-off-by:`，且必须是 CLA 已签署的 `<name> <email>`**（本仓库用 `Signed-off-by: luozhancheng <luozhancheng@huawei.com>`）。
-> - **绝对不要**加 `Co-authored-by:`（如 `Co-authored-by: Claude ...` / `Copilot ...`）或任何第二个署名 —— 这些会引入非 CLA 签署人，导致 CLA 协议检查不通过。
-> - AI（Claude Code / Copilot 等）默认会自动追加 `Co-Authored-By:`，**在本仓库必须关掉/删掉**。
-> - 提交命令（author 用 gmail、signoff 用 huawei 是历史验证可过的组合）：
->   ```bash
->   git -c user.name=luozhancheng -c user.email=luozhancheng@gmail.com \
->     commit --author="luozhancheng <luozhancheng@gmail.com>" -m "feat(x): ...
->
->   Signed-off-by: luozhancheng <luozhancheng@huawei.com>"
->   ```
-> - 若已误推带 `Co-authored-by` 的提交：`git filter-branch -f --msg-filter 'sed "/^Co-authored-by:/d" | cat -s' <base>..HEAD` 重写后 `git push --force-with-lease`。
-> - 用本 skill 的 `submit.sh` / `create-pr.sh` 时，它们的 `commit_signoff` 默认取 `git config user.email`（常是 gmail，CLA 会挂）。**务必设** CLA 邮箱：
->   ```bash
->   export YR_SIGNOFF_NAME=luozhancheng
->   export YR_SIGNOFF_EMAIL=luozhancheng@huawei.com   # 或写入 ~/.config/yr-dev/gitcode.env
->   ```
->   （或直接 `export YR_SIGNOFF="Signed-off-by: luozhancheng <luozhancheng@huawei.com>"`）
+> ⚠️ **CLA 硬性规则**：commit message 只能有一行 `Signed-off-by:`，并且必须使用
+> 当前提交者已经签署 CLA 的身份。不要添加 `Co-authored-by:` 或第二个 signoff。
+> 使用脚本前在私有配置中设置 `YR_SIGNOFF_NAME`、`YR_SIGNOFF_EMAIL`，或设置完整的
+> `YR_SIGNOFF`；skill 和仓库文件中不得硬编码个人身份。已推送错误签名时，先确认
+> 允许重写历史，再使用 `--force-with-lease` 修正。
 
 ### MR 创建
 
@@ -139,7 +127,7 @@ webhook 会检查 Signed-off-by，不通过则 push 或 upstream PR 创建会被
 
 ### Fork → upstream PR 规则
 
-- GitCode API 创建 fork → upstream PR 时，`head` 需要传 `owner:branch`，例如 `luozhancheng:fix/tenant-ref-ds-context`
+- GitCode API 创建 fork → upstream PR 时，`head` 需要传 `owner:branch`，例如 `your-fork-owner:fix/tenant-ref-ds-context`
 - 如果当前仓库 `origin` 是 fork，而目标 `repo` 是 upstream，脚本应自动把 `head` 组装为 `origin-owner:branch`
 - `assignees` 用 **GitCode 用户名**，不是邮箱
 - `Signed-off-by: Name <email>` 写在 **commit message** 里；邮箱用于 signoff，不用于 assignee
@@ -293,8 +281,13 @@ bash build.sh -P   # -j 见下方编译注意事项：先 -j8，OOM 再降
 
 产物 `output/`:
 - `yr-runtime-v0.0.1.tar.gz` — 运行时发布包
-- `openyuanrong_sdk-*.whl` — SDK whl（仅含 yrcli）
-- `openyuanrong-*.whl` / `openyuanrong-*.tar.gz` — 完整安装包（通过 `-P` 生成）
+- `openyuanrong-*.whl` — Python 基础包
+- `openyuanrong_sdk-*.whl` — 独立 Python SDK/`yrcli` 客户端包
+- `openyuanrong_runtime-*.whl`、`openyuanrong_functionsystem-*.whl`、
+  `openyuanrong_datasystem-*.whl` — 默认运行和控制面组件
+- `openyuanrong_faas-*.whl`、`openyuanrong_dashboard-*.whl`、
+  `openyuanrong_cpp_sdk-*.whl` — 可选组件
+- `openyuanrong_full-*.whl` — 保留旧 `yr/inner` 布局的一体化兼容包
 
 ### 编译注意事项
 
@@ -305,6 +298,9 @@ bash build.sh -P   # -j 见下方编译注意事项：先 -j8，OOM 再降
 - `bash build.sh -X off` 禁用异构编译，一般开发不需要
 - `frontend` 和 `yuanrong/go` 的构建脚本里有 `go install ...@latest` 风险；如果网络不稳或工具已存在，优先改成“仅当命令缺失时才安装”
 - `yuanrong/build.sh -P` 在恢复场景下建议支持外部 `BUILD_BASE` / `OUTPUT_BASE`，这样可以切换到新的 Bazel output base 继续，而不是被坏掉的 server 元数据卡死
+- macOS/Apple Silicon 上构建 ARM64 AIO 前，必须先过 Bash 3.2、Docker Desktop
+  内存/磁盘、端到端镜像架构、compile/runtime 边界、split wheel、嵌套 dockerd
+  和 Go plugin ABI 闸门；详见 `references/macos-apple-silicon-aio-build.md`。
 
 ## 安装部署
 
@@ -325,12 +321,24 @@ yr stop
 ### 编译产物安装
 
 ```bash
-pip install openyuanrong_sdk-*.whl
-pip install openyuanrong-*.whl
-export LD_LIBRARY_PATH=/path/to/python/site-packages/yr:/path/to/python/site-packages/yr/inner:/path/to/python/site-packages/yr/inner/runtime/service/python/yr:/path/to/python/site-packages/yr/inner/runtime/service/python/yr/datasystem/lib:$LD_LIBRARY_PATH
+# 仅作为远端集群客户端
+python -m pip install ./output/openyuanrong_sdk-*.whl
+# 本地默认集群：显式安装同一轮构建的 base + runtime/functionsystem/datasystem
+python -m pip install ./output/openyuanrong-*.whl \
+  ./output/openyuanrong_{runtime,functionsystem,datasystem}-*.whl
+# 需要 FaaS/dashboard/C++ SDK 时安装全部 split wheels
+python -m pip install ./output/openyuanrong-*.whl \
+  ./output/openyuanrong_{runtime,functionsystem,datasystem,faas,dashboard,cpp_sdk}-*.whl
+# 只有明确验证旧一体化布局时才使用：
+# python -m pip install ./output/openyuanrong_full-*.whl
 yr start --master
 ```
 
+当前 split-wheel 路径是 `yr/functionsystem`、`yr/datasystem`、`yr/runtime/service`。
+不要沿用 `yr/inner/runtime/service`；需要手工启动二进制时，从 `yr.__file__` 动态计算
+site-packages 根目录，再设置对应 `functionsystem/lib`、`datasystem/lib` 和 runtime 库路径。
+在所有 split wheel 版本元数据完全一致前，不要用 `openyuanrong[default/all]` 代替上述
+显式文件列表，否则 pip resolver 可能因 functionsystem 等组件版本不一致拒绝安装。
 
 ## 本地 ST / A-B 验证（0.8.0 经验）
 
@@ -367,7 +375,9 @@ docker exec yr-e2e-master bash -lc '
 
 ### Mac Docker / Ubuntu 本地构建与 ST 经验
 
-- Docker Desktop 内存建议调到 12GB/16GB+ 后再跑 datasystem/functionsystem `-j8`。
+- Docker Desktop 内存建议调到 16GB+ 后再跑 datasystem/functionsystem `-j8`；全量
+  ARM64 编译叠加 AIO 镜像构建时 24GB 更稳。先用 `docker info` 验证实际生效值，并在
+  失败后查 `OOMKilled`，不要只根据宿主机总内存推断。
 - `functionsystem` 链接阶段若出现 grpc/zlib 间接 DSO 问题（例如 `inflateEnd`、`DSO missing from command line`），不要改源码；优先通过 `run.sh` 的 `--cmake_args` 强制 gold：
 
   ```bash
@@ -379,6 +389,8 @@ docker exec yr-e2e-master bash -lc '
 
 - 若 C++ ST 链接/启动时遇到 `liblitebus.so` 的 `openpty` 未解析，根因通常是缺少 `libutil` 依赖传播；优先用正式重编/打包让相关 `.so` 带 `libutil.so.1` 的 DT_NEEDED。`LD_PRELOAD`、`/etc/ld.so.preload`、`patchelf` 到临时 output 副本只作为本地诊断/绕过，不视为源码修复。
 - 如果 clean C++ ST 在 Mac Docker amd64 emulation 下能启动集群，但卡在 `StartRuntime` / `runtime_executor.cpp:GetCppBuildArgs` 后不出现 `execute final cmd`，先用 x86 Linux/WSL 或持久容器复测同一 `test.sh -b -l cpp` 命令，再判断是否为项目代码问题。
+- 本地 ARM64 AIO 的完整环境判别和 fresh-image 验收清单见
+  `references/macos-apple-silicon-aio-build.md`；AIO 操作入口使用 `yuanrong-aio` skill。
 
 ## 脚本
 
@@ -394,10 +406,10 @@ gitcode.sh diff yuanrong 533                   # 查看变更文件列表
 gitcode.sh commits yuanrong 533                # 查看 MR 的 commits
 gitcode.sh create-pr yuanrong fix/tenant-ref-ds-context \
   "fix[libruntime]: restore tenant context for returned-object DS incref" \
-  "中文说明" --base feature/sandbox --assignees luozhancheng
+  "中文说明" --base feature/sandbox --assignees your-gitcode-user
 gitcode.sh create-pr yuanrong fix/tenant-ref-ds-context \
   "fix[libruntime]: restore tenant context for returned-object DS incref" \
-  "中文说明" --base feature/sandbox --head luozhancheng:fix/tenant-ref-ds-context
+  "中文说明" --base feature/sandbox --head your-fork-owner:fix/tenant-ref-ds-context
 gitcode.sh issues yuanrong --limit 5           # 列出 issue
 gitcode.sh issue yuanrong 123                  # 查看 issue
 gitcode.sh create-issue yuanrong "title" "body"
@@ -421,7 +433,7 @@ create-pr.sh yuanrong "fix(docs): 修复编译文档" "详细说明"
 create-pr.sh yuanrong "fix(docs): 修复编译文档" "" fix/docs-fix  # 指定分支名
 create-pr.sh yuanrong "feat[cli]: 新增命令" "详细说明" "" feature/sandbox  # 指定目标分支
 create-pr.sh yuanrong "fix[libruntime]: 恢复 returned-object 的租户上下文" \
-  "中文说明" "" feature/sandbox --assignees luozhancheng
+  "中文说明" "" feature/sandbox --assignees your-gitcode-user
 ```
 
 自动完成：创建分支 → git add → commit（含 Signed-off-by）→ push → 创建 MR，输出 MR URL。
@@ -483,56 +495,3 @@ Rust FunctionSystem 替换验证的操作细节放在 `yr-buildkite`。在开发
 - 如果 C++ baseline 在同一流程下通过，后续 Rust E2E 失败默认只定位 Rust FunctionSystem 替换链路。
 - baseline 成立前，不为通过 Rust ST 去修改 frontend、runtime、测试断言或其它非 Rust 行为。
 - A/B 对比应保留 case matrix：测试名、A 结果、B 结果、差异类别、复现性、当前 Rust 状态。
-
-## 现成编译环境
-
-历史本机容器 `yr-baseline-test`（基于 `openeuler:22.03-yr-compile`）曾保存完整编译产物：
-
-```bash
-docker start yr-baseline-test
-docker exec -it yr-baseline-test bash
-```
-
-旧宿主机挂载目录示例：`$HOME/workspace/cicd_gitcode/docs_update/build_env/opt_openyuanrong/`。
-
-这类路径是本机资产提示，不是跨机器安装要求；迁移后优先使用 `yr_test` 或 `yr-buildkite` 中的编译镜像流程重建。
-
-## 公共资产
-
-### yr_test
-
-`$HOME/workspace/yr_test` 是本机的 Yuanrong 公共验证资产目录。
-
-优先用途：
-
-- 复用已验证的 `0.7.0` baseline
-- 直接进入 `release_0_7_official/yuanrong` 开新分支验证特性
-- 在固定 build/runtime 容器里挂载外部源码树重新编译
-
-关键入口：
-
-- 根说明：`$HOME/workspace/yr_test/README.md`
-- 容器恢复：`$HOME/workspace/yr_test/handbook/CONTAINERS.md`
-- 最小验证链：`$HOME/workspace/yr_test/handbook/VERIFY.md`
-- 已知坑：`$HOME/workspace/yr_test/handbook/KNOWN_ISSUES.md`
-
-推荐固定镜像 tag：
-
-- `openeuler:22.03-yr-asset-0.7.0`
-- `openeuler:22.03-yuanrong-garden`
-
-### yr_vendor
-
-`$HOME/workspace/code/yr_vendor` 是本机的 Yuanrong 本地依赖归档目录。
-
-用途：
-
-- 固化容易漂移或难下载的三方件
-- 记录不同分支线依赖来源和版本
-- 把“下载源问题”和“代码/构建问题”分开定位
-
-关键入口：
-
-- 说明：`$HOME/workspace/code/yr_vendor/README.md`
-- 总清单：`$HOME/workspace/code/yr_vendor/manifests/yuanrong-deps.md`
-- 当前 0.7.0 种子归档：`$HOME/workspace/code/yr_vendor/manifests/seed-release-0.7.0.md`
