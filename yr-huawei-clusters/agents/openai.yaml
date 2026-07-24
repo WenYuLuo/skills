@@ -1,0 +1,4 @@
+interface:
+  display_name: "YuanRong Huawei Clusters"
+  short_description: "盘点、选择和安全使用华为云上的 YuanRong 集群"
+  default_prompt: "Use $yr-huawei-clusters to inspect my Huawei Cloud YuanRong clusters and recommend the right healthy target."

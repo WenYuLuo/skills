@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cache_base=${YR_HUAWEI_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/yr-huawei-clusters}
+
+if [[ -n "${YR_HUAWEI_PYTHON:-}" ]]; then
+  python_bin=$YR_HUAWEI_PYTHON
+elif [[ -x "$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3" ]]; then
+  python_bin="$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
+else
+  python_bin=$(command -v python3 || true)
+fi
+
+if [[ -z "${python_bin:-}" || ! -x "$python_bin" ]]; then
+  echo "python3 is required; set YR_HUAWEI_PYTHON to a Python 3 executable" >&2
+  exit 1
+fi
+
+python_tag=$("$python_bin" -c 'import sys; print(f"{sys.implementation.name}-{sys.version_info.major}.{sys.version_info.minor}")')
+dependency_dir="$cache_base/$python_tag"
+mkdir -p "$dependency_dir"
+if ! PYTHONPATH="$dependency_dir${PYTHONPATH:+:$PYTHONPATH}" "$python_bin" -c \
+  'import huaweicloudsdkcore, huaweicloudsdkiam, huaweicloudsdkcce, huaweicloudsdkecs' \
+  >/dev/null 2>&1; then
+  packages=(huaweicloudsdkcore huaweicloudsdkiam huaweicloudsdkcce huaweicloudsdkecs)
+  install=("$python_bin" -m pip install --disable-pip-version-check --target "$dependency_dir")
+  if [[ -n "${YR_HUAWEI_PYPI_INDEX_URL:-}" ]]; then
+    install+=(--index-url "$YR_HUAWEI_PYPI_INDEX_URL")
+  fi
+  echo "Installing Huawei Cloud SDK into $dependency_dir" >&2
+  if ! "${install[@]}" "${packages[@]}" >&2; then
+    if [[ -n "${YR_HUAWEI_PYPI_INDEX_URL:-}" ]]; then
+      exit 1
+    fi
+    echo "Default PyPI failed; retrying with the Tsinghua mirror" >&2
+    "${install[@]}" --index-url https://pypi.tuna.tsinghua.edu.cn/simple "${packages[@]}" >&2
+  fi
+fi
+
+exec env PYTHONPATH="$dependency_dir${PYTHONPATH:+:$PYTHONPATH}" \
+  "$python_bin" "$script_dir/huawei_inventory.py" "$@"

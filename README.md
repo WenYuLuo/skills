@@ -7,6 +7,7 @@ Portable local skills for openYuanRong development, Buildkite CI, and GitCode PR
 - `yr-dev` — openYuanRong repository map, GitCode helpers, commit/MR workflow, build order, install/deploy notes, and local asset hints.
 - `yr-local-3vm` — generic local three-node Lima/process-mode deployment, health, E2E, fault, and evidence workflow for any openYuanRong project.
 - `yr-buildkite` — Buildkite status/log/artifact tooling, Rust FunctionSystem E2E trigger, compile image workflow, SWR/image checks, C++ baseline, and A/B ST validation references.
+- `yr-huawei-clusters` — read-only Huawei Cloud CCE/ECS inventory, cluster health, target selection, and access routing.
 - `yuanrong-review` — GitCode PR list/show/review helper across openYuanRong repos.
 
 ## Configuration Model
